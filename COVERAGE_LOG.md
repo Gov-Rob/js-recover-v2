@@ -125,3 +125,21 @@ Static ceiling: **~86.6%** — LLM required for the remaining ~13.4%
 - LLM (Opus 4.6): +2,113 additional names
 - **Combined: 19,732 / 20,335 = 97.0%**
 - Remaining uncertain: 277 (mostly numeric literals and ultra-short single-use vars)
+
+## v6.19 — 2026-03-06
+- **Coverage**: 96.4% (19,608 / 20,335)
+- **LLM**: 1,985 names (batchSize=50, contextPerVar=2000, 48 batches)
+- **Graph**: 4 names (2 communities)
+- **LLM success rate**: 83.1% (improved from 77.8% in v6.17)
+- **Change**: Fixed batchSize 80→50 (better attention per var with larger context)
+- **Commits**: cefe1c0
+
+## v6.20 — 2026-03-06 ⭐ NEW RECORD
+- **Coverage**: 97.8% (19,893 / 20,335)
+- **LLM pass 1**: 1,985 names (batchSize=50, contextPerVar=2000)
+- **LLM pass 2**: +285 names (aggressive mode, 405 residuals → 284 named, 121 remain)
+- **Graph**: 4 names
+- **LLM total**: 2,270 names
+- **Remaining uncertain**: 121 (loop counters, single-use temps with zero signal)
+- **Change**: 2-pass LLM strategy with permissive "aggressive" prompt on residuals
+- **Time**: 13m53s total
