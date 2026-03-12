@@ -167,7 +167,8 @@ function scoreInit(init) {
     }
 
     case 'NewExpression': {
-      const cls = init.callee?.name;
+      // Handle both: new Ctor() and new obj.Ctor()
+      const cls = init.callee?.name ?? init.callee?.property?.name;
       if (!cls) return null;
       const base = cls.charAt(0).toLowerCase() + cls.slice(1);
       return {
@@ -196,6 +197,50 @@ function scoreInit(init) {
       if (callee?.name === 'require' && args?.[0]?.type === 'Literal') {
         const mod = String(args[0].value).split('/').pop().replace(/\W/g, '_');
         return { name: `mod_${mod.slice(0,20)}`, score: 9 };
+      }
+
+      // Lazy module initializer: R(()=>{...}) or S(()=>{...})
+      // These are esbuild/rollup lazy-init wrappers. Name from factory body exports.
+      if ((callee?.name === 'R' || callee?.name === 'S') &&
+          args?.[0] && (args[0].type === 'ArrowFunctionExpression' || args[0].type === 'FunctionExpression')) {
+        const factory = args[0];
+        const GENERIC_KEYS = new Set([
+          'exports','default','index','module','string','buffer','object','number',
+          'length','value','values','entries','keys','items','list','array','result',
+          'middle','state','props','config','options','context','version','source',
+          'target','parent','child','current','last','first','next','prev','self',
+        ]);
+        // Collect export property keys from factory: obj.KEY = value
+        const longKeys = [];
+        function collectExportKeys(body) {
+          if (!body) return;
+          const stmts = Array.isArray(body) ? body : (body.body ?? []);
+          for (const stmt of stmts) {
+            const expr = stmt.type === 'ExpressionStatement' ? stmt.expression : null;
+            if (expr?.type === 'AssignmentExpression' &&
+                expr.left?.type === 'MemberExpression' &&
+                expr.left.property?.type === 'Identifier') {
+              const key = expr.left.property.name;
+              if (key.length >= 5 && !GENERIC_KEYS.has(key)) {
+                longKeys.push(key);
+              }
+            }
+          }
+        }
+        collectExportKeys(factory.body?.body ?? factory.body);
+        if (longKeys.length > 0) {
+          // Pick the most descriptive key (longest, prefer camelCase/UPPER)
+          const best = longKeys.reduce((a, b) => b.length > a.length ? b : a);
+          // Convert ALL_CAPS / UPPER_SNAKE_CASE to camelCase; leave camelCase/PascalCase alone
+          let baseName;
+          if (/^[A-Z][A-Z0-9_]+$/.test(best)) {
+            // e.g. CONNECTIONTOKENCHARS → connectionTokenChars
+            baseName = best.toLowerCase().replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase());
+          } else {
+            baseName = best.charAt(0).toLowerCase() + best.slice(1).replace(/[^a-zA-Z0-9]/g, '');
+          }
+          return { name: `${baseName}Mod`, score: 4 };
+        }
       }
 
       // Symbol.for('key') — named shared symbol (score 9 — very reliable)
@@ -357,12 +402,93 @@ function scoreInit(init) {
       return null;
     }
 
+    case 'MemberExpression': {
+      // var x = obj.PROP — name from property if meaningful
+      const prop = init.property?.name;
+      if (!prop || init.computed) return null;
+      // Uppercase first char → accessing a constructor/class/namespace from a module
+      if (/^[A-Z]/.test(prop) && prop.length >= 3) {
+        const base = prop.charAt(0).toLowerCase() + prop.slice(1);
+        const score = HIGH_PRIO_CTORS.has(prop) ? 9 : 6;
+        const name  = HIGH_PRIO_CTORS.has(prop) ? base : (prop.length >= 5 ? `${base}Ref` : `${base}Ref`);
+        return { name, score };
+      }
+      // Well-known lowercase utility functions imported from modules
+      const MEMBER_PROP_MAP = new Map([
+        ['inherits','inheritsFn'],   ['extname','extName'],
+        ['parse','parseFn'],         ['stringify','stringifyFn'],
+        ['format','formatFn'],       ['resolve','resolveFn'],
+        ['join','joinFn'],           ['basename','baseNameFn'],
+        ['dirname','dirNameFn'],     ['relative','relativePathFn'],
+        ['normalize','normalizeFn'], ['isAbsolute','isAbsoluteFn'],
+        ['createServer','createServerFn'], ['connect','connectFn'],
+        ['createConnection','createConnectionFn'],
+        ['createHash','createHashFn'], ['createHmac','createHmacFn'],
+        ['randomBytes','randomBytesFn'], ['randomUUID','randomUUIDFn'],
+        ['readFile','readFileFn'],   ['writeFile','writeFileFn'],
+        ['readFileSync','readFileSyncFn'], ['writeFileSync','writeFileSyncFn'],
+        ['existsSync','existsSyncFn'], ['mkdirSync','mkdirSyncFn'],
+        ['stat','statFn'],           ['statSync','statSyncFn'],
+        ['readdir','readdirFn'],     ['readdirSync','readdirSyncFn'],
+        ['fetch','fetchFn'],         ['send','sendFn'],
+        ['emit','emitFn'],           ['on','onFn'],
+        ['once','onceFn'],           ['off','offFn'],
+        ['hasOwnProperty','hasPropFn'], ['getOwnPropertyNames','ownKeysFn'],
+        ['getOwnPropertyDescriptor','descriptorFn'],
+        ['defineProperty','definePropFn'], ['assign','assignFn'],
+        ['isApiWritable','isApiWritableFn'],
+        ['default','defaultExport'],
+      ]);
+      const sname = MEMBER_PROP_MAP.get(prop);
+      if (sname) return { name: sname, score: 6 };
+      return null;
+    }
+
+    case 'Identifier': {
+      // var x = GLOBAL_NAME — aliasing a built-in global
+      const GLOBAL_ALIAS = new Map([
+        ['parseInt','parseIntFn'],   ['parseFloat','parseFloatFn'],
+        ['isNaN','isNaNFn'],         ['isFinite','isFiniteFn'],
+        ['encodeURIComponent','encodeURIFn'], ['decodeURIComponent','decodeURIFn'],
+        ['encodeURI','encodeURIFn'], ['decodeURI','decodeURIFn'],
+        ['clearTimeout','clearTimeoutFn'], ['clearInterval','clearIntervalFn'],
+        ['setTimeout','setTimeoutFn'], ['setInterval','setIntervalFn'],
+        ['setImmediate','setImmediateFn'], ['clearImmediate','clearImmediateFn'],
+        ['queueMicrotask','queueMicrotaskFn'],
+        ['Function','functionRef'], ['Object','objectRef'],
+        ['Array','arrayRef'],       ['String','stringRef'],
+        ['Number','numberRef'],     ['Boolean','booleanRef'],
+        ['Symbol','symbolRef'],     ['BigInt','bigIntRef'],
+        ['Proxy','proxyRef'],       ['Reflect','reflectRef'],
+        ['Promise','promiseRef'],   ['WeakRef','weakRef'],
+        ['globalThis','globalRef'], ['global','globalRef'],
+        ['process','processRef'],   ['console','consoleRef'],
+        ['undefined','undefinedVal'],
+      ]);
+      const gname = GLOBAL_ALIAS.get(init.name);
+      if (gname) return { name: gname, score: 7 };
+      return null;
+    }
+
+    case 'AssignmentExpression':
+      // var x = y = z — recurse on the right side
+      return scoreInit(init.right);
+
     case 'ArrowFunctionExpression':
     case 'FunctionExpression':
       return { name: 'fn', score: 4 };
 
     case 'TemplateLiteral':
       return { name: 'tpl', score: 3 };
+
+    case 'LogicalExpression': {
+      // var x = a || b / var x = a && b / var x = a ?? b
+      // Recurse on both sides and pick the higher-confidence one
+      const l = scoreInit(init.left);
+      const r = scoreInit(init.right);
+      if (l && r) return l.score >= r.score ? l : r;
+      return l ?? r ?? null;
+    }
 
     default:
       return null;
@@ -1519,6 +1645,18 @@ function buildAliasIndex(ast, typedVars, funcRetTypes = new Map()) {
         if (callee?.type === 'Identifier') {
           const rt = funcRetTypes.get(callee.name);
           if (rt) addAlias(lhs, { directType: rt.type, score: rt.score });
+
+          // Oe(y) / Oe(y, true) — ESM-interop wrapper: propagate y's type/alias
+          if ((callee.name === 'Oe' || callee.name === 'Ce') &&
+              node.init.arguments?.[0]?.type === 'Identifier') {
+            addAlias(lhs, { alias: node.init.arguments[0].name, score: 4 });
+          }
+
+          // Lazy module call: const x = rd() / cc() / fd() — propagate the lazy var's alias
+          // These are S(factory)-wrapped modules; calling them returns the module exports
+          if (isMinified(callee.name) && node.init.arguments?.length === 0) {
+            addAlias(lhs, { alias: callee.name, score: 3 });
+          }
         } else if (callee?.type === 'MemberExpression' &&
                    callee.object?.type === 'Identifier' &&
                    callee.property?.type === 'Identifier') {
@@ -2145,7 +2283,10 @@ export async function buildRenameMap(source, opts = {}) {
         const b = ensureBinding(node.id.name);
         const r = scoreInit(node.init);
         if (r && r.score > b.initScore) { b.initName = r.name; b.initScore = r.score; }
-      } else if (node.id?.type === 'ObjectPattern') {
+        // Track init-alias source for post-map name propagation (Phase 2.5)
+        if (node.init?.type === 'Identifier' && isMinified(node.init.name)) {
+          if (!b.initAliasSrc) b.initAliasSrc = node.init.name;
+        }      } else if (node.id?.type === 'ObjectPattern') {
         // const { key: aliasName } = source — register the alias binding with key as name hint
         for (const prop of (node.id.properties ?? [])) {
           if (prop.type !== 'Property') continue;
@@ -2263,13 +2404,45 @@ export async function buildRenameMap(source, opts = {}) {
       }
     },
     ImportDeclaration(node) {
+      // Module source → semantic name hint for default/namespace imports
+      const MODULE_HINTS = {
+        path:'pathModule', 'node:path':'pathModule', 'path/posix':'pathPosix',
+        fs:'fsModule', 'node:fs':'fsModule', 'node:fs/promises':'fsPromises',
+        os:'osModule', 'node:os':'osModule',
+        net:'netModule', 'node:net':'netModule',
+        http:'httpModule', 'node:http':'httpModule',
+        https:'httpsModule', 'node:https':'httpsModule',
+        http2:'http2Module', 'node:http2':'http2Module',
+        stream:'streamModule', 'node:stream':'streamModule',
+        crypto:'cryptoModule', 'node:crypto':'cryptoModule',
+        zlib:'zlibModule', 'node:zlib':'zlibModule',
+        url:'urlModule', 'node:url':'urlModule',
+        dns:'dnsModule', 'node:dns':'dnsModule',
+        tls:'tlsModule', 'node:tls':'tlsModule',
+        child_process:'childProcess', 'node:child_process':'childProcess',
+        readline:'readlineModule', 'node:readline':'readlineModule',
+        events:'eventsModule', 'node:events':'eventsModule',
+        util:'utilModule', 'node:util':'utilModule',
+        assert:'assertModule', 'node:assert':'assertModule',
+        buffer:'bufferModule', 'node:buffer':'bufferModule',
+        process:'processModule', 'node:process':'processModule',
+        cluster:'clusterModule', 'node:cluster':'clusterModule',
+        worker_threads:'workerThreads', 'node:worker_threads':'workerThreads',
+        vm:'vmModule', 'node:vm':'vmModule',
+        module:'moduleUtil', 'node:module':'moduleUtil',
+        perf_hooks:'perfHooks', 'node:perf_hooks':'perfHooks',
+        inspector:'inspectorMod', 'node:inspector':'inspectorMod',
+        sqlite:'sqliteModule', 'node:sqlite':'sqliteModule',
+        v8:'v8Module', 'node:v8':'v8Module',
+      };
+      const modName = MODULE_HINTS[node.source?.value];
       // import { key as alias } from '...' — alias bindings with key as name hint
       for (const spec of (node.specifiers ?? [])) {
         if (spec.type === 'ImportSpecifier') {
           const alias = spec.local?.name;
           const key   = spec.imported?.name ?? spec.imported?.value;
           if (!alias || !isMinified(alias)) continue;
-          if (key && typeof key === 'string' && key.length >= 4 &&
+          if (key && typeof key === 'string' && key.length >= 3 &&
               !/^(default|exports?|module|value|type|name|node|data|key|meta|spec)$/.test(key)) {
             const b = ensureBinding(alias);
             if (7 > b.initScore) { b.initName = key; b.initScore = 7; }
@@ -2278,7 +2451,9 @@ export async function buildRenameMap(source, opts = {}) {
           }
         } else if (spec.type === 'ImportDefaultSpecifier' || spec.type === 'ImportNamespaceSpecifier') {
           const alias = spec.local?.name;
-          if (alias && isMinified(alias)) ensureBinding(alias);
+          if (!alias || !isMinified(alias)) continue;
+          const b = ensureBinding(alias);
+          if (modName && 8 > b.initScore) { b.initName = modName; b.initScore = 8; }
         }
       }
     },
@@ -2627,6 +2802,30 @@ export async function buildRenameMap(source, opts = {}) {
         uncertain.push(mangled);
       }
     }
+  }
+
+  // Phase 3.5: Name-propagation alias pass
+  // For each uncertain var B where B = A (Identifier alias) and A is already named,
+  // propagate A's final name to B as a variant. Runs after Phase 3 so the map is complete.
+  // This catches simple alias chains: const filteredResult = existingFilter → filteredResult_2
+  {
+    let propagated = 0;
+    const stillUncertain1 = uncertain.filter(v => {
+      const b = bindings.get(v);
+      const src = b?.initAliasSrc;
+      if (!src || map[v]) return true; // already named or no alias src
+      const srcName = map[src];
+      if (!srcName) return true; // source not named either
+      // Propagate: give v a variant of src's name
+      map[v] = unique(srcName);
+      propagated++;
+      return false;
+    });
+    if (propagated > 0 && process.env.DEBUG) {
+      console.error(`[phase-3.5] name-alias propagation: +${propagated} names`);
+    }
+    uncertain.length = 0;
+    uncertain.push(...stillUncertain1);
   }
 
   // Phase 4: Copilot LLM for uncertain variables
