@@ -300,6 +300,34 @@ function scoreInit(init) {
                 candidates.push({ name: `${cname.charAt(0).toLowerCase()+cname.slice(1)}Cls`, priority: 8 });
               }
             }
+            // Assignment to var with array literal: someVar = ["fix","fix-pr-comment","task"]
+            // Use longest slug-case or descriptive string element as name hint
+            else if (node.left?.type === 'Identifier' && node.right?.type === 'ArrayExpression') {
+              const elems = node.right.elements ?? [];
+              const strs = elems.map(e => e?.value).filter(s => typeof s === 'string' && s.length >= 3);
+              if (strs.length >= 2) {
+                // Pick longest string element
+                const best = strs.reduce((a,b) => b.length > a.length ? b : a, strs[0]);
+                // Convert slug-case to camelCase: "fix-pr-comment" → "fixPrComment"
+                const cname = best.replace(/[^a-zA-Z0-9]+([a-zA-Z])/g, (_,c)=>c.toUpperCase())
+                               .replace(/^[^a-zA-Z]*/, '').replace(/[^a-zA-Z0-9]/g,'');
+                if (cname.length >= 4) candidates.push({ name: `${cname.charAt(0).toLowerCase()+cname.slice(1)}Types`, priority: 4 });
+              }
+            }
+            // Assignment to var with regex literal: someVar = /pattern/
+            else if (node.left?.type === 'Identifier' && node.right?.type === 'Literal' && node.right.regex) {
+              candidates.push({ name: 'patternRegex', priority: 3 });
+            }
+          }
+
+          // new TypedArray(n) as top-level VariableDeclarator init → lookupTable hint
+          if (node.type === 'ExpressionStatement' &&
+              node.expression?.type === 'AssignmentExpression' &&
+              node.expression.right?.type === 'NewExpression') {
+            const ctor = node.expression.right.callee?.name ?? '';
+            if (['Uint8Array','Uint16Array','Uint32Array','Int8Array','Int32Array','Float32Array','Float64Array'].includes(ctor)) {
+              candidates.push({ name: `${ctor.charAt(0).toLowerCase()+ctor.slice(1)}Table`, priority: 3 });
+            }
           }
           
           if (node.type === 'VariableDeclaration') {
@@ -344,6 +372,23 @@ function scoreInit(init) {
                 const objKey = bestObjKey(init);
                 if (objKey) candidates.push({ name: `${objKey}Obj`, priority: 5 });
               }
+              // var x = new TypedArray(n) — buffer/lookup table init
+              if (init.type === 'NewExpression') {
+                const ctor = init.callee?.name ?? '';
+                if (['Uint8Array','Uint16Array','Uint32Array','Int8Array','Int32Array','Float32Array','Float64Array'].includes(ctor)) {
+                  candidates.push({ name: `${ctor.charAt(0).toLowerCase()+ctor.slice(1)}Table`, priority: 3 });
+                }
+              }
+              // var x = ["str1","str2",...] — string enum/list
+              if (init.type === 'ArrayExpression') {
+                const strs = (init.elements ?? []).map(e=>e?.value).filter(s=>typeof s==='string' && s.length >= 3);
+                if (strs.length >= 2) {
+                  const best = strs.reduce((a,b) => b.length > a.length ? b : a, strs[0]);
+                  const cname = best.replace(/[^a-zA-Z0-9]+([a-zA-Z])/g, (_,c)=>c.toUpperCase())
+                                 .replace(/^[^a-zA-Z]*/, '').replace(/[^a-zA-Z0-9]/g,'');
+                  if (cname.length >= 4) candidates.push({ name: `${cname.charAt(0).toLowerCase()+cname.slice(1)}Types`, priority: 4 });
+                }
+              }
             }
           }
           
@@ -362,6 +407,37 @@ function scoreInit(init) {
         }
         
         walkForExports(factory.body, 0);
+
+        // Locale/i18n factory detection: body contains function returning {string:{unit:...},...}
+        // Pattern: ml(); xCo = () => { let t = {string:{unit:"chars",verb:"..."}, file:{...},...} }
+        // These are Zod/i18n locale modules (38 factories in Copilot bundle)
+        function hasLocaleObj(node, depth, fnDepth) {
+          if (!node || typeof node !== 'object' || depth > 12) return false;
+          if (node.type === 'FunctionExpression' || node.type === 'ArrowFunctionExpression') {
+            if (fnDepth >= 2) return false; // max 2 nested function scopes
+            fnDepth++;
+          }
+          if (node.type === 'ObjectExpression') {
+            const sp = node.properties?.find(p => p.key?.name === 'string');
+            if (sp?.value?.type === 'ObjectExpression' &&
+                sp.value.properties?.some(p => p.key?.name === 'unit' || p.key?.name === 'verb')) {
+              return true;
+            }
+          }
+          for (const k of Object.keys(node)) {
+            if (k === 'type' || k === 'start' || k === 'end') continue;
+            const child = node[k];
+            if (Array.isArray(child)) {
+              for (const item of child) {
+                if (item && typeof item.type === 'string' && hasLocaleObj(item, depth+1, fnDepth)) return true;
+              }
+            } else if (child && typeof child.type === 'string' && hasLocaleObj(child, depth+1, fnDepth)) return true;
+          }
+          return false;
+        }
+        if (hasLocaleObj(factory.body, 0, 0)) {
+          candidates.push({ name: 'localeMod', priority: 6 });
+        }
 
         if (candidates.length > 0) {
           candidates.sort((a,b) => b.priority - a.priority);
