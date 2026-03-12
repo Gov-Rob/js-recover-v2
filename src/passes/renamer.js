@@ -210,37 +210,62 @@ function scoreInit(init) {
           'middle','state','props','config','options','context','version','source',
           'target','parent','child','current','last','first','next','prev','self',
         ]);
-        // Collect export property keys from factory: obj.KEY = value
-        const longKeys = [];
-        function collectExportKeys(body) {
-          if (!body) return;
-          const stmts = Array.isArray(body) ? body : (body.body ?? []);
-          for (const stmt of stmts) {
-            const expr = stmt.type === 'ExpressionStatement' ? stmt.expression : null;
-            if (expr?.type === 'AssignmentExpression' &&
-                expr.left?.type === 'MemberExpression' &&
-                expr.left.property?.type === 'Identifier') {
-              const key = expr.left.property.name;
-              if (key.length >= 5 && !GENERIC_KEYS.has(key)) {
-                longKeys.push(key);
+        
+        // Deep-scan factory body for naming clues
+        const body = factory.body?.body ?? (Array.isArray(factory.body) ? factory.body : []);
+        const candidates = []; // {name, priority}
+
+        for (const stmt of body) {
+          const decls = stmt.type === 'VariableDeclaration' ? stmt.declarations : [];
+          for (const decl of decls) {
+            const init = decl.init;
+            if (!init) continue;
+            // Ce("node:xxx") imports → highest priority
+            if (init.type === 'CallExpression' && init.callee?.name === 'Ce') {
+              const mod = init.arguments?.[0]?.value;
+              if (typeof mod === 'string') {
+                const short = mod.replace(/^node:/, '').replace(/\//g,'_');
+                if (!['buffer','util','events'].includes(short)) { // too generic
+                  const cname = short.replace(/_([a-z])/g,(_,c)=>c.toUpperCase());
+                  candidates.push({ name: `${cname}Mod`, priority: 9 });
+                }
+              }
+            }
+            // DestructuredPattern from a call: var{longName:x, longName2:y} = require()
+            if (decl.id?.type === 'ObjectPattern' && init.type === 'CallExpression') {
+              for (const prop of decl.id.properties || []) {
+                const key = prop.key?.name ?? prop.key?.value;
+                if (typeof key === 'string' && key.length >= 8 && !GENERIC_KEYS.has(key)) {
+                  candidates.push({ name: `${key.charAt(0).toLowerCase()+key.slice(1)}Mod`, priority: 7 });
+                }
+              }
+            }
+            // Symbol("name") → symbolName
+            if (init.type === 'CallExpression' && init.callee?.name === 'Symbol') {
+              const sym = init.arguments?.[0]?.value;
+              if (typeof sym === 'string' && sym.length >= 3) {
+                candidates.push({ name: `sym_${toIdentifier(sym).slice(0,20)}`, priority: 6 });
               }
             }
           }
-        }
-        collectExportKeys(factory.body?.body ?? factory.body);
-        if (longKeys.length > 0) {
-          // Pick the most descriptive key (longest, prefer camelCase/UPPER)
-          const best = longKeys.reduce((a, b) => b.length > a.length ? b : a);
-          // Convert ALL_CAPS / UPPER_SNAKE_CASE to camelCase; leave camelCase/PascalCase alone
-          let baseName;
-          if (/^[A-Z][A-Z0-9_]+$/.test(best)) {
-            // e.g. CONNECTIONTOKENCHARS → connectionTokenChars
-            baseName = best.toLowerCase().replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase());
-          } else {
-            baseName = best.charAt(0).toLowerCase() + best.slice(1).replace(/[^a-zA-Z0-9]/g, '');
+          // Export assignment: obj.longKey = val
+          const expr = stmt.type === 'ExpressionStatement' ? stmt.expression : null;
+          if (expr?.type === 'AssignmentExpression' &&
+              expr.left?.type === 'MemberExpression' &&
+              expr.left.property?.type === 'Identifier') {
+            const key = expr.left.property.name;
+            if (key.length >= 5 && !GENERIC_KEYS.has(key)) {
+              candidates.push({ name: `${key.charAt(0).toLowerCase()+key.slice(1)}Mod`, priority: 4 });
+            }
           }
-          return { name: `${baseName}Mod`, score: 4 };
         }
+
+        if (candidates.length > 0) {
+          candidates.sort((a,b) => b.priority - a.priority);
+          const best = candidates[0];
+          return { name: best.name, score: Math.min(best.priority, 7) };
+        }
+        return null;
       }
 
       // Symbol.for('key') — named shared symbol (score 9 — very reliable)

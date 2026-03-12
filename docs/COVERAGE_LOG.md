@@ -5,7 +5,62 @@ All measurements on `app.stripped.js` (15.5MB GitHub Copilot bundle, 20,335 bind
 
 ---
 
-## 2026-03-14 — v6.5 Alias Propagation + LogicalExpr/AssignmentExpr
+## 2026-03-15 — v6.8 R/S Factory Body Deep-Scan
+
+| Mode | Named | Total | Coverage |
+|------|-------|-------|----------|
+| static | 16,665 | 20,335 | **82.0%** |
+
+Changes from v6.7 → v6.8 (+64 names):
+- R()/S() factory body scan enhanced: detects `Ce("node:xxx")` imports, destructured long-name imports (≥8 chars), `Symbol("name")` calls
+- Factory scan priority: Ce-import (9) > destructured key (7) > Symbol (6) > export assignment (4)
+- Removed old shallow scan; replaced with priority-sorted candidate list
+
+Commit: pending
+
+---
+
+## 2026-03-15 — v6.7 Long-Prop MemberExpr, BinaryExpr/ConditionalExpr/FunctionExpr
+
+| Mode | Named | Total | Coverage |
+|------|-------|-------|----------|
+| static | 16,601 | 20,335 | **81.6%** |
+
+Changes from v6.6 → v6.7 (+184 names):
+- `scoreInit()` MemberExpression: long camelCase props (≥5 chars) used directly as name (score 7)
+  `x = obj.extractBody` → `extractBody`; action prefixed props (`getXxx`, `createXxx`) → score 8
+- `scoreInit()` string-arg factory: strip `[[bracket]]` wrapping before testing PascalCase
+- `scoreInit()` regex-arg: `fn(/pattern/)` → `patternRegex` (score 4)
+- `scoreInit()` array-arg (≥2 elems): `arrayDef` (score 3)
+- `scoreInit()` ConditionalExpression: `a?b:c` → score both branches, pick higher (new case)
+- `scoreInit()` BinaryExpression: string concat → `concatStr`, comparisons → `boolResult`, arithmetic → `numResult`
+- `scoreInit()` FunctionExpression/ArrowFunctionExpression: `async→asyncFn`, `generator→generatorFn`, single-expr body recurse
+
+Commit: `71e6428`
+
+---
+
+## 2026-03-15 — v6.6 Schema Builders, String-Arg Factories, Extended MemberPropMap
+
+| Mode | Named | Total | Coverage |
+|------|-------|-------|----------|
+| static | 16,417 | 20,335 | **80.7%** |
+
+Changes from v6.5 → v6.6 (+816 names):
+- `scoreInit()` CallExpression: Zod/Yup/Joi schema builder method detection
+  `obj.object({key:...})` → `keySchema`; `obj.extend({...})` → `firstKeySchema`; `obj.union([])` → `unionSchema`
+- `scoreInit()` CallExpression: first-string-arg factory `fn("ClassName")` → `classNameDef`
+  (e.g. `hn("$ZodError", base)` → `zodErrorDef`)
+- `scoreInit()` CallExpression: object-shape first-key `fn({key:...})` → `keyConfig`
+- `scoreInit()`: UnaryExpression (`!x→negated`, `-x→negNum`, `typeof→typeStr`, `void→undefinedVal`)
+- `scoreInit()`: AwaitExpression (recurse on argument, fallback `awaited`)
+- `scoreInit()`: ChainExpression (recurse on inner expression `x?.y`)
+- MEMBER_PROP_MAP: +50 common value properties (length/count, status, message, url, path, etc.)
+- MemberPropMap score: 6 → 5 (property name alone less reliable than method calls)
+
+Commit: `fc03d3c`
+
+---
 
 | Mode | Named | Total | Coverage |
 |------|-------|-------|----------|
