@@ -29,11 +29,17 @@ const MODEL_PREFERENCE = [
 //   Sonnet: same limits via Copilot → use 150
 //   gpt-4o: 128K window → use 100
 const MODEL_PROFILES = {
-  'claude-opus':   { ctxWindow: 128_000, contextPerVar: 600,  batchSize: 200, maxOut: 16000 },
-  'claude-sonnet': { ctxWindow: 128_000, contextPerVar: 500,  batchSize: 150, maxOut: 12000 },
-  'gpt-4o':        { ctxWindow: 128_000, contextPerVar: 400,  batchSize: 100, maxOut: 6000  },
-  'gpt-4o-mini':   { ctxWindow: 128_000, contextPerVar: 300,  batchSize: 40,  maxOut: 3000  },
-  'default':       { ctxWindow: 32_000,  contextPerVar: 300,  batchSize: 15,  maxOut: 1200  },
+  // contextPerVar: max chars per var in LLM prompt (matches extractContextMulti: 5×400=2000)
+  // batchSize:    vars per API call — (ctxWindow×3.5×0.70 - overhead) / contextPerVar
+  //   Opus:    (128K×3.5×0.70 - 3000) / 2000 ≈ 155 → use 80 for quality focus
+  //   Sonnet:  same window, slightly less context → 60
+  //   gpt-4o:  (128K×3.5×0.70 - 3000) / 1600 ≈ 195 → use 60
+  //   mini:    (128K×3.5×0.60 - 2000) / 1000 ≈ 267 → use 30
+  'claude-opus':   { ctxWindow: 128_000, contextPerVar: 2000, batchSize: 50,  maxOut: 16000 },
+  'claude-sonnet': { ctxWindow: 128_000, contextPerVar: 1600, batchSize: 60,  maxOut: 12000 },
+  'gpt-4o':        { ctxWindow: 128_000, contextPerVar: 1600, batchSize: 60,  maxOut: 6000  },
+  'gpt-4o-mini':   { ctxWindow: 128_000, contextPerVar: 1000, batchSize: 30,  maxOut: 3000  },
+  'default':       { ctxWindow: 32_000,  contextPerVar: 600,  batchSize: 10,  maxOut: 1200  },
 };
 
 let _token     = null;
@@ -194,14 +200,42 @@ function parseRenameJson(text, mangledNames) {
  * @param {{ name: string, context: string }[]} batch
  * @returns {Promise<Record<string,string>>}  mangled → semantic
  */
-export async function llmNameBatch(batch) {
+/**
+ * @param {{ name: string, context: string }[]} batch
+ * @param {{ aggressive?: boolean }} [opts]
+ */
+export async function llmNameBatch(batch, opts = {}) {
   if (!batch.length) return {};
 
   const model = await resolveModel();
   const profile = getProfile(model);
 
-  const prompt =
-`You are an expert JavaScript reverse-engineer. Given minified variable names and their surrounding source code, produce precise, readable camelCase names.
+  const isAggressive = opts.aggressive ?? false;
+
+  const prompt = isAggressive
+    ? `You are a JavaScript variable renamer. These variables resisted confident naming in a prior pass. Use structural heuristics to assign a plausible name to EVERY variable — do not return null.
+
+RULES:
+- Output ONLY valid JSON: {"mangledName": "semanticName"}
+- camelCase (or PascalCase for classes), max 25 chars, valid JS identifier
+- Use these pattern conventions if context is sparse:
+    callbacks/event handlers → handler, callback, cb, listener, fn
+    config/options objects   → opts, config, cfg, settings, options
+    error values             → err, error
+    result/return values     → result, value, val, ret
+    counters/indices         → i, idx, count, index
+    boolean flags            → flag, enabled, active, isReady
+    string/message           → msg, str, text, label
+    array/list               → items, list, arr, entries, values
+    map/object               → map, obj, data, record, table
+    node/element             → node, el, element, target
+    state                    → state, ctx, context
+- NEVER output the original mangled name or null — always provide a plausible alternative
+- No markdown, no explanation — raw JSON only
+
+VARIABLES:
+${batch.map(b => `### ${b.name}\n\`\`\`js\n${b.context.slice(0, profile.contextPerVar)}\n\`\`\``).join('\n\n')}`
+    : `You are an expert JavaScript reverse-engineer. Given minified variable names and their surrounding source code, produce precise, readable camelCase names.
 
 RULES:
 - Output ONLY valid JSON: {"mangledName": "semanticName" | null}

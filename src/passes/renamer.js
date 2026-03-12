@@ -4067,6 +4067,39 @@ export async function buildRenameMap(source, opts = {}) {
     }
   }
 
+  // Phase 4b: Second LLM pass — aggressive naming of residual uncertain vars
+  // Uses a permissive prompt (no null returns) targeting pattern conventions.
+  const llmPasses = opts.llmPasses ?? 1;
+  if (llm && llmPasses >= 2 && process.env.GH_TOKEN) {
+    try {
+      const { llmNameBatch } = await import('../llm/copilot.js');
+      const residual = uncertain.filter(v => !map[v]);
+      if (residual.length > 0) {
+        const pass2BatchSize = Math.min(30, residual.length);
+        if (process.env.DEBUG) console.error(`[llm-pass2] ${residual.length} residual vars (batch=${pass2BatchSize})`);
+        for (let i = 0; i < residual.length; i += pass2BatchSize) {
+          const batch = residual.slice(i, i + pass2BatchSize).map(name => ({
+            name,
+            context: extractContextMulti(source, name),
+          }));
+          try {
+            const llmMap = await llmNameBatch(batch, { aggressive: true });
+            for (const [mangled, semantic] of Object.entries(llmMap)) {
+              if (!map[mangled] && semantic !== mangled) {
+                map[mangled] = unique(semantic);
+                llmCount++;
+              }
+            }
+          } catch (e) {
+            if (process.env.DEBUG) console.error(`[llm-pass2-batch-${i}]`, e.message);
+          }
+        }
+      }
+    } catch (e) {
+      if (process.env.DEBUG) console.error('[llm-pass2-import]', e.message);
+    }
+  }
+
   // Phase 5: HelixHyper graph pipeline
   // Runs AFTER static + LLM phases so it only sees truly uncertain vars.
   // Uses co-occurrence graph + community detection + influence propagation.
