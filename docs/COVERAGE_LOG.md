@@ -1,7 +1,42 @@
 # Coverage Measurement Log
 
-All measurements on `app.stripped.js` (15.5MB GitHub Copilot bundle, 18,066 bindings).
+All measurements on `app.stripped.js` (15.5MB GitHub Copilot bundle, 20,335 bindings).
 `static` = no seeds, no LLM. `+seeds` = with `copilot-app.seeds.json` (9,131 entries).
+
+---
+
+## 2026-03-14 — v6.5 Alias Propagation + LogicalExpr/AssignmentExpr
+
+| Mode | Named | Total | Coverage |
+|------|-------|-------|----------|
+| static | 15,601 | 20,335 | **76.7%** |
+| static + seeds | ~19,984 | 20,335 | ~98.3% |
+
+Changes from v6.4 → v6.5 (+774 names):
+- `scoreInit()`: `AssignmentExpression` case recurses on `.right` (catches `var x = y = z`)
+- `scoreInit()`: `LogicalExpression` case scores both branches, picks higher confidence
+- `buildAliasIndex`: `Oe(y)` / `Ce(y)` module interop wrappers propagate first-arg alias
+- `buildAliasIndex`: lazy callee pattern `var x = rd()` propagates alias from callee (`rd`)
+
+Commit: `19c25c7`
+
+---
+
+## 2026-03-13 — v6.4 scoreInit Expansion
+
+| Mode | Named | Total | Coverage |
+|------|-------|-------|----------|
+| static | 14,827 | 20,335 | **72.9%** |
+| static + seeds | ~19,984 | 20,335 | ~98.3% |
+
+Changes from v6.3 → v6.4 (+321 names):
+- `scoreInit()` `NewExpression`: handle `new obj.Ctor()` via `callee.property.name`
+- `scoreInit()` new `MemberExpression` case: `var x = y.PROP` with `MEMBER_PROP_MAP`
+- `scoreInit()` new `Identifier` case: global built-in alias detection (30+ built-ins)
+- `scoreInit()` `CallExpression`: R()/S() lazy module factory export key scanning
+- Phase 3.5: name-propagation alias pass after Phase 3 map is built
+
+Commit: `e17dbe8`
 
 ---
 
