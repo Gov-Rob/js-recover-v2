@@ -231,6 +231,51 @@ function scoreInit(init) {
           }
           return null;
         }
+
+        // Mine name hints from an anonymous ClassExpression body:
+        // 1) Method names ≥6 chars (priority 7)
+        // 2) Constructor this.propName assignments ≥7 chars (priority 6)
+        // 3) Extends class name (priority 5)
+        function mineAnonymousClass(cls) {
+          const body = cls.body?.body ?? [];
+          const GENERIC_METHODS = new Set(['constructor','toString','valueOf','render',
+            'init','setup','update','reset','clear','create','destroy','dispose',
+            'start','stop','run','execute','process','handle']);
+          // 1. Method names
+          for (const m of body) {
+            if (m.type !== 'MethodDefinition' && m.type !== 'PropertyDefinition') continue;
+            const mname = m.key?.name;
+            if (mname && mname.length >= 6 && /^[a-z][a-zA-Z0-9]+$/.test(mname) && !GENERIC_METHODS.has(mname)) {
+              return { name: `${mname}Cls`, priority: 7 };
+            }
+          }
+          // 2. Constructor this.propName
+          const ctor = body.find(m => m.type === 'MethodDefinition' && m.key?.name === 'constructor');
+          if (ctor) {
+            const stmts = ctor.value?.body?.body ?? [];
+            for (const stmt of stmts) {
+              const exprs = stmt?.expression?.type === 'SequenceExpression'
+                ? stmt.expression.expressions
+                : stmt?.expression ? [stmt.expression] : [];
+              for (const expr of exprs) {
+                if (expr?.type === 'AssignmentExpression' &&
+                    expr.left?.type === 'MemberExpression' &&
+                    expr.left.object?.type === 'ThisExpression') {
+                  const pname = expr.left.property?.name;
+                  if (pname && pname.length >= 7 && !pname.startsWith('_') && !GENERIC_KEYS.has(pname)) {
+                    return { name: `${pname}Cls`, priority: 6 };
+                  }
+                }
+              }
+            }
+          }
+          // 3. Extends class name
+          if (cls.superClass?.name && /^[A-Z]/.test(cls.superClass.name)) {
+            const sname = cls.superClass.name.charAt(0).toLowerCase() + cls.superClass.name.slice(1);
+            return { name: `${sname}Ext`, priority: 5 };
+          }
+          return null;
+        }
         
         // Recursive AST walk to find CJS export patterns deeply nested in body
         function walkForExports(node, depth) {
@@ -243,6 +288,10 @@ function scoreInit(init) {
             const cname = node.id?.name;
             if (cname && /^[A-Z]/.test(cname)) {
               candidates.push({ name: `${cname.charAt(0).toLowerCase()+cname.slice(1)}Cls`, priority: 8 });
+            } else if (node.type === 'ClassDeclaration') {
+              // Anonymous class declaration — mine its body
+              const hint = mineAnonymousClass(node);
+              if (hint) candidates.push(hint);
             }
           }
 
@@ -293,11 +342,15 @@ function scoreInit(init) {
               const objKey = bestObjKey(node.right);
               if (objKey) candidates.push({ name: `${objKey}Obj`, priority: 5 });
             }
-            // Assignment to var with class: someVar = class ClassName {...}
+            // Assignment to var with class: someVar = class ClassName {...} OR anonymous class
             else if (node.left?.type === 'Identifier' && node.right?.type === 'ClassExpression') {
               const cname = node.right.id?.name;
               if (cname && /^[A-Z]/.test(cname)) {
                 candidates.push({ name: `${cname.charAt(0).toLowerCase()+cname.slice(1)}Cls`, priority: 8 });
+              } else {
+                // Anonymous class — mine methods and constructor this-properties
+                const hint = mineAnonymousClass(node.right);
+                if (hint) candidates.push(hint);
               }
             }
             // Assignment to var with array literal: someVar = ["fix","fix-pr-comment","task"]
@@ -317,6 +370,14 @@ function scoreInit(init) {
             // Assignment to var with regex literal: someVar = /pattern/
             else if (node.left?.type === 'Identifier' && node.right?.type === 'Literal' && node.right.regex) {
               candidates.push({ name: 'patternRegex', priority: 3 });
+            }
+            // Assignment to var with TypedArray: someVar = new Uint8Array(n)
+            else if (node.left?.type === 'Identifier' && node.right?.type === 'NewExpression') {
+              const ctor = node.right.callee?.name ?? '';
+              const TYPED_ARRAYS = ['Uint8Array','Uint16Array','Uint32Array','Int8Array','Int16Array','Int32Array','Float32Array','Float64Array','BigUint64Array','BigInt64Array'];
+              if (TYPED_ARRAYS.includes(ctor)) {
+                candidates.push({ name: `${ctor.charAt(0).toLowerCase()+ctor.slice(1)}Table`, priority: 3 });
+              }
             }
           }
 
@@ -362,10 +423,15 @@ function scoreInit(init) {
                   candidates.push({ name: `sym_${toIdentifier(sym).slice(0,20)}`, priority: 6 });
                 }
               }
-              // var x = class ClassName {...}
-              if (init.type === 'ClassExpression' && init.id?.name && /^[A-Z]/.test(init.id.name)) {
-                const cname = init.id.name;
-                candidates.push({ name: `${cname.charAt(0).toLowerCase()+cname.slice(1)}Cls`, priority: 8 });
+              // var x = class ClassName {...} OR anonymous class
+              if (init.type === 'ClassExpression') {
+                if (init.id?.name && /^[A-Z]/.test(init.id.name)) {
+                  const cname = init.id.name;
+                  candidates.push({ name: `${cname.charAt(0).toLowerCase()+cname.slice(1)}Cls`, priority: 8 });
+                } else {
+                  const hint = mineAnonymousClass(init);
+                  if (hint) candidates.push(hint);
+                }
               }
               // var x = {longKey: val, ...} — object initialization with descriptive keys
               if (init.type === 'ObjectExpression') {
@@ -544,6 +610,25 @@ function scoreInit(init) {
         ]);
         const key = `${obj}.${prop}`;
         if (MEM_MAP.has(key)) return { name: MEM_MAP.get(key), score: 8 };
+
+        // React.memo(({propA, propB, ...}) => ...) → propAPropBComp (score 7)
+        if (prop === 'memo') {
+          const fn = args?.[0];
+          if (fn?.type === 'ArrowFunctionExpression' || fn?.type === 'FunctionExpression') {
+            const firstParam = fn.params?.[0];
+            if (firstParam?.type === 'ObjectPattern') {
+              const propNames = firstParam.properties
+                .filter(p => p.type !== 'RestElement' && p.key?.type === 'Identifier' && p.key.name.length >= 4)
+                .slice(0, 3)
+                .map(p => p.key.name);
+              if (propNames.length > 0) {
+                const joined = propNames.map((n, i) => i === 0 ? n : n.charAt(0).toUpperCase() + n.slice(1)).join('');
+                return { name: `${joined.slice(0, 24)}Comp`, score: 7 };
+              }
+            }
+          }
+          return { name: 'memoComp', score: 6 };
+        }
 
         if (prop === 'bind')        return { name: 'boundFn', score: 6 };
         if (prop === 'call')        return { name: 'callResult', score: 5 };
@@ -822,6 +907,31 @@ function scoreInit(init) {
       if (init.async) return { name: 'asyncFn', score: 4 };
       // Generator function
       if (init.generator) return { name: 'generatorFn', score: 4 };
+
+      // TypeScript enum factory: function(t){ return t[t.Auto=0]="Auto", t[t.FlexStar=1]="FlexStar", t }
+      // Detect: single param, BlockStatement body, ReturnStatement with sequence of t[t.Key=N]="Key" exprs
+      if (!init.async && !init.generator && params.length === 1 && body?.type === 'BlockStatement') {
+        const ret = body.body?.find(s => s.type === 'ReturnStatement');
+        if (ret) {
+          const exprs = ret.argument?.type === 'SequenceExpression'
+            ? ret.argument.expressions
+            : ret.argument ? [ret.argument] : [];
+          for (const expr of exprs) {
+            if (expr?.type === 'AssignmentExpression' &&
+                expr.right?.type === 'Literal' &&
+                typeof expr.right.value === 'string' &&
+                expr.right.value.length >= 3 &&
+                /^[A-Z]/.test(expr.right.value) &&
+                expr.left?.type === 'MemberExpression' &&
+                expr.left.computed) {
+              // e.g. t[t.Auto=0]="Auto" → autoEnum
+              const eName = expr.right.value.charAt(0).toLowerCase() + expr.right.value.slice(1);
+              return { name: `${eName.slice(0, 24)}Enum`, score: 7 };
+            }
+          }
+        }
+      }
+
       // Single-expression body that hints at what it returns
       if (body?.type !== 'BlockStatement') {
         const inner = scoreInit(body);
