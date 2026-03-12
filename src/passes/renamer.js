@@ -1171,6 +1171,54 @@ const NAMESPACE_SIGNATURES = [
   // HTML parse error types
   { name: 'htmlParseErrors', score: 9, required: 3,
     props: new Set(['duplicateAttribute','unexpectedNullCharacter','unexpectedQuestionMarkInsteadOfTagName','eofBeforeTagName','invalidFirstCharacterOfTagName','missingEndTagName']) },
+  // DOM Node type constants (Node.ELEMENT_NODE etc.)
+  { name: 'domNodeTypes',    score: 9, required: 3,
+    props: new Set(['ELEMENT_NODE','ATTRIBUTE_NODE','TEXT_NODE','CDATA_SECTION_NODE','ENTITY_REFERENCE_NODE','ENTITY_NODE','PROCESSING_INSTRUCTION_NODE','COMMENT_NODE','DOCUMENT_NODE','DOCUMENT_FRAGMENT_NODE']) },
+  // Semver regex named keys (semver.js internal)
+  { name: 'semverRegexKeys', score: 9, required: 4,
+    props: new Set(['HYPHENRANGELOOSE','HYPHENRANGE','COMPARATORTRIM','TILDETRIM','CARETTRIM','COMPARATORLOOSE','BUILD','TILDELOOSE','TILDE','CARET']) },
+  // YAML AST node type constants
+  { name: 'yamlNodeTypes',   score: 9, required: 4,
+    props: new Set(['ALIAS','DOC','MAP','NODE_TYPE','PAIR','SCALAR','SEQ']) },
+  // SQLite permission constants
+  { name: 'sqliteConsts',    score: 9, required: 3,
+    props: new Set(['SQLITE_READ','SQLITE_SELECT','SQLITE_FUNCTION','SQLITE_RECURSIVE','SQLITE_OK','SQLITE_PRAGMA','SQLITE_DENY','SQLITE_CREATE_TABLE','SQLITE_DROP_TABLE']) },
+  // Terminal environment variable names (supports-color, chalk)
+  { name: 'termEnvVars',     score: 9, required: 4,
+    props: new Set(['FORCE_COLOR','TERM','CI_NAME','TEAMCITY_VERSION','COLORTERM','TERM_PROGRAM_VERSION','TERM_PROGRAM','NO_COLOR','FORCE_LEVEL']) },
+  // WebSocket frame opcode constants (ws library)
+  { name: 'wsOpcodes',       score: 9, required: 4,
+    props: new Set(['CLOSE','PING','PONG','CONTINUATION','TEXT','BINARY']) },
+  // XML/HTML/SVG namespace prefix constants
+  { name: 'xmlNamespaces',   score: 9, required: 4,
+    props: new Set(['XML','XLINK','XMLNS','HTML','SVG','MATHML']) },
+  // Virtual DOM operation types (parse5/snabbdom pattern)
+  { name: 'vdomOps',         score: 8, required: 4,
+    props: new Set(['VALUE','ATTR','REMOVE_ATTR','REMOVE','INSERT','MOVE','REPLACE']) },
+  // Parse5 internal constant groups
+  { name: 'parse5Consts',    score: 9, required: 4,
+    props: new Set(['NAMESPACES','ATTRS','DOCUMENT_MODE','TAG_NAMES','SPECIAL_ELEMENTS']) },
+  // HTML serialization special strings
+  { name: 'htmlSpecialStr',  score: 9, required: 3,
+    props: new Set(['SCRIPT_STRING','DASH_DASH_STRING','DOCTYPE_STRING','CDATA_START_STRING','PUBLIC_STRING','SYSTEM_STRING']) },
+  // LSP FileOperation notifications/requests
+  { name: 'lspFileEvents',   score: 9, required: 3,
+    props: new Set(['DidCreateFilesNotification','WillCreateFilesRequest','DidRenameFilesNotification','WillRenameFilesRequest','DidDeleteFilesNotification','WillDeleteFilesRequest']) },
+  // LSP ProtocolRequestType / ProtocolNotificationType classes
+  { name: 'lspProtoTypes',   score: 9, required: 3,
+    props: new Set(['ProtocolNotificationType','ProtocolNotificationType0','ProtocolRequestType','ProtocolRequestType0','RegistrationType']) },
+  // LSP SemanticTokens request types
+  { name: 'lspSemTokens',    score: 9, required: 3,
+    props: new Set(['SemanticTokensRefreshRequest','SemanticTokensRangeRequest','SemanticTokensDeltaRequest','SemanticTokensRequest','SemanticTokensRegistrationType']) },
+  // LSP NotebookDocument sync types
+  { name: 'lspNotebookDocs', score: 9, required: 3,
+    props: new Set(['DidOpenNotebookDocumentNotification','DidChangeNotebookDocumentNotification','DidSaveNotebookDocumentNotification','DidCloseNotebookDocumentNotification','NotebookDocumentSyncRegistrationType']) },
+  // LSP CallHierarchy request types
+  { name: 'lspCallHierarchy',score: 9, required: 2,
+    props: new Set(['CallHierarchyOutgoingCallsRequest','CallHierarchyIncomingCallsRequest','CallHierarchyPrepareRequest']) },
+  // LSP base RPC types (RequestType, NotificationType)
+  { name: 'lspRpcTypes',     score: 8, required: 3,
+    props: new Set(['RequestType0','RequestType','NotificationType0','NotificationType','ProgressType']) },
 ];
 
 function buildNamespaceSigIndex(shapeIndex) {
@@ -1792,6 +1840,22 @@ Object.assign(TYPE_NAMES, {
   semverParts:    'semverParts',
   typeEnum:       'typeEnum',
   htmlParseErrors:'htmlParseErrors',
+  domNodeTypes:   'domNodeTypes',
+  semverRegexKeys:'semverRegexKeys',
+  yamlNodeTypes:  'yamlNodeTypes',
+  sqliteConsts:   'sqliteConsts',
+  termEnvVars:    'termEnvVars',
+  wsOpcodes:      'wsOpcodes',
+  xmlNamespaces:  'xmlNamespaces',
+  vdomOps:        'vdomOps',
+  parse5Consts:   'parse5Consts',
+  htmlSpecialStr: 'htmlSpecialStr',
+  lspFileEvents:  'lspFileEvents',
+  lspProtoTypes:  'lspProtoTypes',
+  lspSemTokens:   'lspSemTokens',
+  lspNotebookDocs:'lspNotebookDocs',
+  lspCallHierarchy:'lspCallHierarchy',
+  lspRpcTypes:    'lspRpcTypes',
 });
 
 function buildCallArgIndex(ast) {
@@ -2077,10 +2141,26 @@ export async function buildRenameMap(source, opts = {}) {
 
   walk.simple(ast, {
     VariableDeclarator(node) {
-      if (node.id?.type !== 'Identifier') return;
-      const b = ensureBinding(node.id.name);
-      const r = scoreInit(node.init);
-      if (r && r.score > b.initScore) { b.initName = r.name; b.initScore = r.score; }
+      if (node.id?.type === 'Identifier') {
+        const b = ensureBinding(node.id.name);
+        const r = scoreInit(node.init);
+        if (r && r.score > b.initScore) { b.initName = r.name; b.initScore = r.score; }
+      } else if (node.id?.type === 'ObjectPattern') {
+        // const { key: aliasName } = source — register the alias binding with key as name hint
+        for (const prop of (node.id.properties ?? [])) {
+          if (prop.type !== 'Property') continue;
+          if (prop.value?.type !== 'Identifier') continue;
+          const alias = prop.value.name;
+          if (!isMinified(alias)) continue;
+          const key = prop.key?.name ?? prop.key?.value;
+          if (!key || typeof key !== 'string' || key.length < 4) continue;
+          // Skip overly generic keys that carry no semantic weight
+          if (/^(key|val|data|type|name|node|next|prev|self|this|base|init|temp|item|list|args|opts|prop|attr|spec|info|meta|elem|root|head|tail|body|text|code|size|flag|mode|kind|path|file|part|rest|all|any|max|min|set|get|add|has|map)$/.test(key)) continue;
+          const b = ensureBinding(alias);
+          // Score 7: destructured key name is reliable semantic hint
+          if (7 > b.initScore) { b.initName = key; b.initScore = 7; }
+        }
+      }
     },
     AssignmentExpression(node) {
       if (node.left?.type !== 'Identifier') return;
@@ -2180,6 +2260,26 @@ export async function buildRenameMap(source, opts = {}) {
           else if (p.type === 'AssignmentPattern' && p.left?.type === 'Identifier')
             ensureBinding(p.left.name);
         });
+      }
+    },
+    ImportDeclaration(node) {
+      // import { key as alias } from '...' — alias bindings with key as name hint
+      for (const spec of (node.specifiers ?? [])) {
+        if (spec.type === 'ImportSpecifier') {
+          const alias = spec.local?.name;
+          const key   = spec.imported?.name ?? spec.imported?.value;
+          if (!alias || !isMinified(alias)) continue;
+          if (key && typeof key === 'string' && key.length >= 4 &&
+              !/^(default|exports?|module|value|type|name|node|data|key|meta|spec)$/.test(key)) {
+            const b = ensureBinding(alias);
+            if (7 > b.initScore) { b.initName = key; b.initScore = 7; }
+          } else {
+            ensureBinding(alias);
+          }
+        } else if (spec.type === 'ImportDefaultSpecifier' || spec.type === 'ImportNamespaceSpecifier') {
+          const alias = spec.local?.name;
+          if (alias && isMinified(alias)) ensureBinding(alias);
+        }
       }
     },
   });
