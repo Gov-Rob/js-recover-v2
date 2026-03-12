@@ -3692,8 +3692,316 @@ export async function buildRenameMap(source, opts = {}) {
       if (process.env.DEBUG) console.error(`[phase-3.11] Factory-body call assign: +${count311}`);
     }
   }
+
+  // Phase 3.12: IIFE numeric enum detection (return-form)
+  // Pattern: `x = (function(t){return t[t.BorderBox=0]="BorderBox",...,t})({})` 
+  // These are TS enums compiled with return instead of mutation.
+  // Also handles: `x = (function(t){return t[t.Width=0]="Width",...,t})({})`
+  {
+    const unc312 = new Set(uncertain);
+    let count312 = 0;
+    const GENERIC_ENUM_KEYS = new Set(['None','All','Default','Unknown','Error','Warning','Info','Debug',
+      'Success','Failure','Start','End','Begin','Finish','On','Off','Yes','No','True','False','OK']);
+    walk.simple(ast, {
+      VariableDeclarator(node) {
+        const v = node.id?.name;
+        if (!v || !unc312.has(v) || map[v]) return;
+        const init = node.init;
+        if (!init || init.type !== 'CallExpression') return;
+        const callee = init.callee;
+        if (callee?.type !== 'FunctionExpression') return;
+        if (callee.params?.length !== 1) return;
+        const param = callee.params[0].name;
+        // Body should have a ReturnStatement whose argument is SequenceExpression or AssignmentExpression
+        const stmts = callee.body?.body ?? [];
+        if (stmts.length === 0) return;
+        const lastStmt = stmts[stmts.length - 1];
+        if (lastStmt?.type !== 'ReturnStatement') return;
+        // Collect all expressions from return argument (which may be SequenceExpression)
+        const retArg = lastStmt.argument;
+        const exprs = retArg?.type === 'SequenceExpression'
+          ? retArg.expressions
+          : retArg ? [retArg] : [];
+        if (exprs.length === 0) return;
+        // Check that last expression is the param identifier (returns t)
+        const lastExpr = exprs[exprs.length - 1];
+        if (lastExpr?.type !== 'Identifier' || lastExpr.name !== param) return;
+        // Find a t[t.KEY=N]="KEY" assignment to extract a good key name
+        let bestKey = null;
+        for (const expr of exprs) {
+          // t[t.KEY=N]="KEY" → expr is AssignmentExpression, right is string Literal
+          if (expr?.type === 'AssignmentExpression' && expr.right?.type === 'Literal' &&
+              typeof expr.right.value === 'string' && expr.right.value.length >= 3) {
+            const key = expr.right.value;
+            if (/^[A-Z][a-zA-Z0-9]+$/.test(key) && !GENERIC_ENUM_KEYS.has(key)) {
+              bestKey = key;
+              break;
+            }
+            if (!bestKey && key.length >= 3) bestKey = key;
+          }
+        }
+        if (!bestKey) return;
+        const enumBase = bestKey.charAt(0).toUpperCase() + bestKey.slice(1);
+        map[v] = unique(enumBase.charAt(0).toLowerCase() + enumBase.slice(1) + 'Enum');
+        count312++;
+      }
+    });
+    if (count312 > 0) {
+      const stillUncertain = uncertain.filter(v => !map[v]);
+      uncertain.length = 0;
+      uncertain.push(...stillUncertain);
+      if (process.env.DEBUG) console.error(`[phase-3.12] IIFE numeric enum (return-form): +${count312}`);
+    }
+  }
+
+  // Phase 3.13: Fluent builder .name("string") chain extraction
+  // Pattern: `x = new Cls().name("cmdName").summary(...)...`
+  // OR `x = someFactory().command("name").option(...)`
+  // The .name() or .command() method call with a string literal arg provides the var's semantic name.
+  {
+    const unc313 = new Set(uncertain);
+    let count313 = 0;
+    const BUILDER_METHODS = new Set(['name','command','title','label','id','key']);
+    function extractBuilderName(init) {
+      let current = init;
+      let depth = 0;
+      while (current && depth < 15) {
+        depth++;
+        if (current.type === 'CallExpression') {
+          const callee = current.callee;
+          if (callee?.type === 'MemberExpression' && !callee.computed) {
+            const meth = callee.property?.name;
+            if (BUILDER_METHODS.has(meth) && current.arguments?.[0]?.type === 'Literal' &&
+                typeof current.arguments[0].value === 'string') {
+              const val = current.arguments[0].value;
+              if (val.length >= 2 && val.length <= 40) return val;
+            }
+          }
+          current = callee?.object ?? null;
+        } else if (current.type === 'NewExpression') {
+          current = null; // stop
+        } else {
+          current = current.callee?.object ?? null;
+        }
+      }
+      return null;
+    }
+    walk.simple(ast, {
+      VariableDeclarator(node) {
+        const v = node.id?.name;
+        if (!v || !unc313.has(v) || map[v]) return;
+        const init = node.init;
+        if (!init || (init.type !== 'CallExpression' && init.type !== 'NewExpression')) return;
+        const name = extractBuilderName(init);
+        if (!name) return;
+        const safe = name.replace(/[^a-zA-Z0-9\s-_]/g,'').trim();
+        const camel = safe.replace(/[\s-_]+([a-z])/gi, (_,c) => c.toUpperCase())
+          .replace(/^[A-Z]/, c => c.toLowerCase()).replace(/[^a-zA-Z0-9]/g,'');
+        if (camel.length >= 2) {
+          map[v] = unique(camel + 'Cmd');
+          count313++;
+        }
+      }
+    });
+    if (count313 > 0) {
+      const stillUncertain = uncertain.filter(v => !map[v]);
+      uncertain.length = 0;
+      uncertain.push(...stillUncertain);
+      if (process.env.DEBUG) console.error(`[phase-3.13] Fluent builder name extraction: +${count313}`);
+    }
+  }
+
+  // Phase 3.14: AssignmentExpression chain extraction for DOM/enum constants
+  // Pattern: `var x = x = SomeObj.CONSTANT_NAME = N`
+  // The VariableDeclarator init is `AssignmentExpression(left=x, right=AssignmentExpression(left=Obj.PROP, right=N))`
+  // Or simply: `var x = SomeObj.CONSTANT_NAME = N`
+  // Extract CONSTANT_NAME (convert SCREAMING_SNAKE_CASE to camelCase)
+  {
+    const unc314 = new Set(uncertain);
+    let count314 = 0;
+    function extractConstantName(node) {
+      if (!node) return null;
+      if (node.type === 'AssignmentExpression') {
+        // Try left: if it's a MemberExpression with a useful property
+        if (node.left?.type === 'MemberExpression' && !node.left.computed && node.left.property?.name) {
+          const prop = node.left.property.name;
+          if (/^[A-Z][A-Z0-9_]+$/.test(prop) && prop.length >= 4) return prop;
+        }
+        // Try right recursively
+        const fromRight = extractConstantName(node.right);
+        if (fromRight) return fromRight;
+        const fromLeft = extractConstantName(node.left);
+        if (fromLeft) return fromLeft;
+      }
+      return null;
+    }
+    const screamToCamel = s => {
+      return s.split('_').map((w,i) => i === 0
+        ? w.charAt(0).toLowerCase() + w.slice(1).toLowerCase()
+        : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()
+      ).join('');
+    };
+    walk.simple(ast, {
+      VariableDeclarator(node) {
+        const v = node.id?.name;
+        if (!v || !unc314.has(v) || map[v]) return;
+        const init = node.init;
+        if (!init || init.type !== 'AssignmentExpression') return;
+        const prop = extractConstantName(init);
+        if (!prop) return;
+        const camel = screamToCamel(prop);
+        if (camel.length >= 3) {
+          map[v] = unique(camel);
+          count314++;
+        }
+      }
+    });
+    if (count314 > 0) {
+      const stillUncertain = uncertain.filter(v => !map[v]);
+      uncertain.length = 0;
+      uncertain.push(...stillUncertain);
+      if (process.env.DEBUG) console.error(`[phase-3.14] Assignment chain DOM constants: +${count314}`);
+    }
+  }
+
+  // Phase 3.15: Misc semantic patterns
+  {
+    const unc315 = new Set(uncertain);
+    let count315 = 0;
+    const screamToCamel315 = s => s.split('_').map((w,i) => i===0
+      ? w.charAt(0).toLowerCase()+w.slice(1).toLowerCase()
+      : w.charAt(0).toUpperCase()+w.slice(1).toLowerCase()).join('');
+
+    walk.simple(ast, {
+      VariableDeclarator(node) {
+        const v = node.id?.name;
+        if (!v || !unc315.has(v) || map[v]) return;
+        const init = node.init;
+        if (!init) return;
+
+        // Pattern A: g1(Obj.SCREAMING_PROP, "") — icon factory with empty label, prop in first arg
+        if (init.type === 'CallExpression') {
+          const callee = init.callee;
+          const args = init.arguments ?? [];
+          if (callee?.type === 'Identifier' && callee.name === 'g1'
+              && args.length >= 2 && args[1]?.type === 'Literal' && args[1].value === ''
+              && args[0]?.type === 'MemberExpression' && !args[0].computed) {
+            const prop = args[0].property?.name;
+            if (prop && /^[A-Z][A-Z0-9_]+$/.test(prop) && prop.length >= 3) {
+              map[v] = unique(screamToCamel315(prop) + 'Icon');
+              count315++;
+              return;
+            }
+          }
+          // Pattern B: IIFE containing new TextDecoder / new TextEncoder
+          if ((callee?.type === 'FunctionExpression' || callee?.type === 'ArrowFunctionExpression')
+              && args.length === 0) {
+            const body = source.slice(init.start, Math.min(init.end, init.start + 400));
+            if (body.includes('new TextDecoder')) { map[v] = unique('textDecoder'); count315++; return; }
+            if (body.includes('new TextEncoder')) { map[v] = unique('textEncoder'); count315++; return; }
+          }
+        }
+
+        // Pattern C: LogicalExpression with __extends helper
+        if (init.type === 'LogicalExpression') {
+          const txt = source.slice(init.start, Math.min(init.end, init.start + 200));
+          if (txt.includes('.__extends')) {
+            map[v] = unique('extendsHelper');
+            count315++;
+            return;
+          }
+        }
+      }
+    });
+
+    if (count315 > 0) {
+      const stillUncertain = uncertain.filter(v => !map[v]);
+      uncertain.length = 0;
+      uncertain.push(...stillUncertain);
+      if (process.env.DEBUG) console.error(`[phase-3.15] Misc semantic patterns: +${count315}`);
+    }
+  }
+
+  // Phase 3.16: VariableDeclarator-init CallExpression with long MemberExpression callee
+  // Pattern: `var x = someObj.longMethod(args)` — direct init (not factory-body assignment)
+  // Complements Phase 3.11 which only covers factory-body AssignmentExpression
+  {
+    const unc316 = new Set(uncertain);
+    let count316 = 0;
+    walk.simple(ast, {
+      VariableDeclarator(node) {
+        const v = node.id?.name;
+        if (!v || !unc316.has(v) || map[v]) return;
+        const init = node.init;
+        if (!init || init.type !== 'CallExpression') return;
+        const callee = init.callee;
+        if (!callee || callee.type !== 'MemberExpression' || callee.computed) return;
+        const method = callee.property?.name;
+        if (!method) return;
+        const obj = callee.object;
+        const objName = obj?.type === 'Identifier' ? obj.name : null;
+        const objNamed = objName && map[objName] ? map[objName] : null;
+        // Long method name (≥8 chars) → use method name directly
+        if (method.length >= 8) {
+          const base = method[0].toLowerCase() + method.slice(1);
+          map[v] = unique(base);
+          count316++;
+          return;
+        }
+        // Known receiver + shorter method (≥4 chars) → objCore + Method
+        if (objNamed && method.length >= 4) {
+          const core = objNamed.replace(/(?:Cls|Obj|Fn|Mod|Result|Export|_\d+)$/, '');
+          if (core.length >= 3) {
+            map[v] = unique(core + method[0].toUpperCase() + method.slice(1));
+            count316++;
+            return;
+          }
+        }
+      }
+    });
+    if (count316 > 0) {
+      const stillUncertain = uncertain.filter(v => !map[v]);
+      uncertain.length = 0;
+      uncertain.push(...stillUncertain);
+      if (process.env.DEBUG) console.error(`[phase-3.16] Direct-init long method calls: +${count316}`);
+    }
+  }
+
+  // Phase 3.17: Third-pass alias propagation (catches vars pointing to newly-named vars from 3.14-3.16)
+  {
+    const unc317 = new Set(uncertain);
+    let count317 = 0;
+    walk.simple(ast, {
+      VariableDeclarator(node) {
+        const v = node.id?.name;
+        if (!v || !unc317.has(v) || map[v]) return;
+        const init = node.init;
+        if (!init) return;
+        // x = namedVar
+        if (init.type === 'Identifier' && !map[v] && map[init.name]) {
+          const src317 = map[init.name];
+          const core = src317.replace(/_\d+$/, '').replace(/(?:Cls|Obj|Fn|Mod|Export)$/, '');
+          if (core.length >= 3) { map[v] = unique(core + 'Ref'); count317++; }
+        }
+        // x = namedVar.default
+        if (init.type === 'MemberExpression' && !init.computed
+            && init.property?.name === 'default' && init.object?.type === 'Identifier'
+            && !map[v] && map[init.object.name]) {
+          const src317 = map[init.object.name];
+          const core = src317.replace(/_\d+$/, '').replace(/(?:Cls|Obj|Fn|Mod|Export)$/, '');
+          if (core.length >= 3) { map[v] = unique(core + 'Default'); count317++; }
+        }
+      }
+    });
+    if (count317 > 0) {
+      const stillUncertain = uncertain.filter(v => !map[v]);
+      uncertain.length = 0;
+      uncertain.push(...stillUncertain);
+      if (process.env.DEBUG) console.error(`[phase-3.17] Third-pass alias propagation: +${count317}`);
+    }
+  }
   let llmCount = 0;
-  const llmMaxVars = opts.llmMaxVars ?? Infinity; // no cap by default — model limits itself
+  const llmMaxVars = opts.llmMaxVars ?? Infinity;
 
   if (llm && process.env.GH_TOKEN && uncertain.length > 0) {
     try {
