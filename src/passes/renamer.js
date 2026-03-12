@@ -298,6 +298,7 @@ function scoreInit(init) {
       if (callee?.type === 'MemberExpression') {
         const obj = callee.object?.name;
         const prop = callee.property?.name;
+        const meth = prop; // alias used below for schema builder check
         const MEM_MAP = new Map([
           ['Object.create','proto'],['Object.assign','merged'],['Object.freeze','frozen'],
           ['Object.keys','keys'],['Object.values','values'],['Object.entries','entries'],
@@ -398,7 +399,52 @@ function scoreInit(init) {
         if (prop === 'createTextNode') return { name: 'textNode', score: 7 };
 
         if (obj === 'Promise')      return { name: 'promise', score: 7 };
+
+        // Schema builder methods (Zod / Yup / Joi / Valibot patterns):
+        // obj.object({...}), obj.extend({...}), obj.union([...]), etc.
+        const SCHEMA_METHODS = new Set([
+          'object','extend','union','intersection','discriminatedUnion','array','tuple',
+          'string','number','boolean','bigint','symbol','undefined','null','void','any',
+          'unknown','never','optional','nullable','required','partial','passthrough',
+          'strict','strip','catch','describe','brand','refine','superRefine','transform',
+          'pipe','and','or','pick','omit','merge','deepPartial','readonly','promise',
+          'function','lazy','set','map','record','with','schema','validate','shape',
+        ]);
+        if (meth && SCHEMA_METHODS.has(meth)) {
+          // Extract first named key from ObjectExpression arg → keySchema
+          const firstArg = args?.[0];
+          if (firstArg?.type === 'ObjectExpression' && firstArg.properties?.length > 0) {
+            const fp = firstArg.properties.find(p =>
+              p.key?.type === 'Identifier' && /^[a-zA-Z]{3,}/.test(p.key.name));
+            if (fp) return { name: `${fp.key.name}Schema`, score: 7 };
+          }
+          if (firstArg?.type === 'ArrayExpression') return { name: 'unionSchema', score: 6 };
+          return { name: `${meth}Schema`, score: 5 };
+        }
       }
+
+      // First-string-arg factory: fn("ClassName", ...) → classNameDef
+      // e.g. hn("$ZodError", base) → zodErrorDef  |  vl("ChainedTokenCredential") → chainedTokenCredentialDef
+      if (args?.[0]?.type === 'Literal' && typeof args[0].value === 'string') {
+        const label = String(args[0].value).replace(/^[$_]+/, '');
+        if (label.length >= 4 && /^[A-Z][a-zA-Z0-9]{2,}$/.test(label)) {
+          const base = label.charAt(0).toLowerCase() + label.slice(1);
+          return { name: `${base}Def`, score: 7 };
+        }
+        // Generic string label for other factories (at least 4 chars, looks like identifier)
+        if (label.length >= 4 && /^[a-zA-Z][a-zA-Z0-9_.:-]{2,}$/.test(label) && !/\s/.test(label)) {
+          const ident = label.replace(/[^a-zA-Z0-9]/g, '_').replace(/_{2,}/g,'_');
+          return { name: `${ident}Val`, score: 5 };
+        }
+      }
+
+      // Object-shape first-key: fn({key: ..., ...}) → keyConfig
+      if (args?.[0]?.type === 'ObjectExpression' && args[0].properties?.length > 0) {
+        const fp = args[0].properties.find(p =>
+          p.key?.type === 'Identifier' && /^[a-zA-Z]{3,}/.test(p.key.name));
+        if (fp) return { name: `${fp.key.name}Config`, score: 5 };
+      }
+
       return null;
     }
 
@@ -438,9 +484,41 @@ function scoreInit(init) {
         ['defineProperty','definePropFn'], ['assign','assignFn'],
         ['isApiWritable','isApiWritableFn'],
         ['default','defaultExport'],
+        // Common value properties
+        ['length','count'],          ['size','size'],
+        ['name','name'],             ['type','typeStr'],
+        ['status','status'],         ['statusCode','statusCode'],
+        ['message','msg'],           ['stack','stackTrace'],
+        ['code','code'],             ['url','url'],
+        ['path','path'],             ['href','urlHref'],
+        ['hostname','hostname'],     ['port','port'],
+        ['protocol','protocol'],     ['pathname','pathname'],
+        ['host','host'],             ['origin','origin'],
+        ['method','httpMethod'],     ['headers','headers'],
+        ['body','body'],             ['signal','signal'],
+        ['timeout','timeout'],       ['id','id'],
+        ['key','key'],               ['version','version'],
+        ['buffer','buf'],            ['encoding','encoding'],
+        ['socket','socket'],         ['server','server'],
+        ['client','client'],         ['request','req'],
+        ['response','res'],          ['stream','stream'],
+        ['handler','handler'],       ['callback','cb'],
+        ['options','opts'],          ['config','config'],
+        ['params','params'],         ['query','query'],
+        ['args','args'],             ['listeners','listeners'],
+        ['controller','controller'], ['readable','readable'],
+        ['writable','writable'],     ['error','err'],
+        ['result','result'],         ['value','val'],
+        ['data','data'],             ['output','output'],
+        ['input','input'],           ['target','target'],
+        ['source','source'],         ['context','ctx'],
+        ['scope','scope'],           ['env','env'],
+        ['debug','debugFn'],         ['warn','warnFn'],
+        ['info','infoFn'],           ['log','logFn'],
+        ['prototype','proto'],       ['constructor','ctor'],
       ]);
       const sname = MEMBER_PROP_MAP.get(prop);
-      if (sname) return { name: sname, score: 6 };
+      if (sname) return { name: sname, score: 5 };
       return null;
     }
 
@@ -473,6 +551,32 @@ function scoreInit(init) {
     case 'AssignmentExpression':
       // var x = y = z — recurse on the right side
       return scoreInit(init.right);
+
+    case 'UnaryExpression': {
+      const { operator: op, argument: arg } = init;
+      if (op === '!') {
+        if (arg?.type === 'Literal') return { name: 'boolVal', score: 5 }; // !1 = false, !0 = true
+        return { name: 'negated', score: 4 };
+      }
+      if (op === '-') {
+        if (arg?.type === 'Literal' && typeof arg.value === 'number')
+          return { name: 'negNum', score: 4 };
+        return { name: 'negNum', score: 3 };
+      }
+      if (op === '~')      return { name: 'bitwise', score: 4 };
+      if (op === '+')      return { name: 'numCast', score: 3 };
+      if (op === 'typeof') return { name: 'typeStr', score: 6 };
+      if (op === 'void')   return { name: 'undefinedVal', score: 4 };
+      return null;
+    }
+
+    case 'AwaitExpression':
+      // Recurse on awaited expression; fallback to 'awaited'
+      return scoreInit(init.argument) ?? { name: 'awaited', score: 3 };
+
+    case 'ChainExpression':
+      // Optional chaining: x?.prop / x?.method() — recurse on inner expression
+      return scoreInit(init.expression);
 
     case 'ArrowFunctionExpression':
     case 'FunctionExpression':
