@@ -425,8 +425,12 @@ function scoreInit(init) {
 
       // First-string-arg factory: fn("ClassName", ...) → classNameDef
       // e.g. hn("$ZodError", base) → zodErrorDef  |  vl("ChainedTokenCredential") → chainedTokenCredentialDef
+      // Also handles bracket-wrapped: xI("[[ErrorSteps]]") → errorStepsDef
       if (args?.[0]?.type === 'Literal' && typeof args[0].value === 'string') {
-        const label = String(args[0].value).replace(/^[$_]+/, '');
+        const label = String(args[0].value)
+          .replace(/^\[+|\]+$/g, '')   // strip [[...]] bracket wrapping
+          .replace(/^[$_@#]+/, '')      // strip leading special chars
+          .trim();
         if (label.length >= 4 && /^[A-Z][a-zA-Z0-9]{2,}$/.test(label)) {
           const base = label.charAt(0).toLowerCase() + label.slice(1);
           return { name: `${base}Def`, score: 7 };
@@ -443,6 +447,18 @@ function scoreInit(init) {
         const fp = args[0].properties.find(p =>
           p.key?.type === 'Identifier' && /^[a-zA-Z]{3,}/.test(p.key.name));
         if (fp) return { name: `${fp.key.name}Config`, score: 5 };
+      }
+
+      // Array-arg call: fn([a, b, c]) → used for Zod tuples/unions, middleware arrays, etc.
+      if (args?.[0]?.type === 'ArrayExpression' && (args[0].elements?.length ?? 0) >= 2) {
+        return { name: 'arrayDef', score: 3 };
+      }
+
+      // RegExp-arg call: fn(/pattern/) → used for matchers, validators, parsers
+      if (args?.[0]?.type === 'Literal' && args[0].regex) {
+        const src = args[0].regex.pattern?.slice(0, 20).replace(/[^a-zA-Z0-9]/g, '') || '';
+        if (src.length >= 3) return { name: `${src.slice(0,16)}Regex`, score: 4 };
+        return { name: 'regexMatcher', score: 3 };
       }
 
       return null;
@@ -519,6 +535,23 @@ function scoreInit(init) {
       ]);
       const sname = MEMBER_PROP_MAP.get(prop);
       if (sname) return { name: sname, score: 5 };
+      // Long descriptive camelCase property — use directly as name
+      // e.g. x = obj.extractBody → extractBody (score 7)
+      // e.g. x = obj.getSocketInfo → getSocketInfo (score 7)
+      const GENERIC_PROPS = new Set([
+        'then','catch','finally','next','done','value','return','throw',
+        'data','body','result','error','items','list','map','set','get','has',
+        'add','delete','clear','size','length','keys','values','entries',
+        'call','apply','bind','toString','valueOf','toJSON','assign','create',
+        'from','of','all','race','resolve','reject','any',
+      ]);
+      if (prop.length >= 5 && /^[a-z][a-zA-Z0-9]{4,}$/.test(prop) && !GENERIC_PROPS.has(prop)) {
+        return { name: prop.slice(0, 30), score: 7 };
+      }
+      // Descriptive method-like property starting with get/set/create/build/parse/make
+      if (/^(?:get|set|create|build|parse|make|init|reset|fetch|load|save|update|remove|handle)[A-Z]/.test(prop)) {
+        return { name: prop.slice(0, 30), score: 8 };
+      }
       return null;
     }
 
@@ -579,8 +612,19 @@ function scoreInit(init) {
       return scoreInit(init.expression);
 
     case 'ArrowFunctionExpression':
-    case 'FunctionExpression':
+    case 'FunctionExpression': {
+      const { params = [], body } = init;
+      // Async function
+      if (init.async) return { name: 'asyncFn', score: 4 };
+      // Generator function
+      if (init.generator) return { name: 'generatorFn', score: 4 };
+      // Single-expression body that hints at what it returns
+      if (body?.type !== 'BlockStatement') {
+        const inner = scoreInit(body);
+        if (inner && inner.score >= 5) return { name: `get${inner.name.charAt(0).toUpperCase()}${inner.name.slice(1)}`, score: 4 };
+      }
       return { name: 'fn', score: 4 };
+    }
 
     case 'TemplateLiteral':
       return { name: 'tpl', score: 3 };
@@ -592,6 +636,37 @@ function scoreInit(init) {
       const r = scoreInit(init.right);
       if (l && r) return l.score >= r.score ? l : r;
       return l ?? r ?? null;
+    }
+
+    case 'ConditionalExpression': {
+      // var x = cond ? a : b — score both branches, take higher confidence
+      const cTrue = scoreInit(init.consequent);
+      const cFalse = scoreInit(init.alternate);
+      if (cTrue && cFalse) return cTrue.score >= cFalse.score ? cTrue : cFalse;
+      return cTrue ?? cFalse ?? null;
+    }
+
+    case 'BinaryExpression': {
+      const { operator: bop, left, right } = init;
+      // String concatenation: x = "prefix" + y → "prefix" is informative
+      if (bop === '+') {
+        if (left?.type === 'Literal' && typeof left.value === 'string' && left.value.length >= 3) {
+          const prefix = left.value.replace(/[^a-zA-Z0-9]/g, '').slice(0, 16);
+          if (prefix.length >= 3) return { name: `${prefix}Str`, score: 4 };
+        }
+        if (right?.type === 'Literal' && typeof right.value === 'string' && right.value.length >= 3) {
+          const suffix = right.value.replace(/[^a-zA-Z0-9]/g, '').slice(0, 16);
+          if (suffix.length >= 3) return { name: `${suffix}Str`, score: 3 };
+        }
+        return { name: 'concatStr', score: 3 };
+      }
+      // Comparison → boolean result
+      if (['===','!==','==','!=','<','<=','>','>='].includes(bop)) return { name: 'boolResult', score: 3 };
+      // Arithmetic
+      if (['-','*','/','%','**'].includes(bop)) return { name: 'numResult', score: 3 };
+      // Bitwise
+      if (['&','|','^','<<','>>','>>>'].includes(bop)) return { name: 'bitwise', score: 3 };
+      return null;
     }
 
     default:
