@@ -107,17 +107,35 @@ function stringLiteralToName(str) {
  * Extract multiple occurrence snippets of `varName` from source for richer LLM context.
  * Returns up to `maxOcc` distinct line-level snippets joined by ' | '.
  */
-function extractContextMulti(source, varName, maxOcc = 3, radius = 500) {
+function extractContextMulti(source, varName, maxOcc = 5, radius = 400) {
   const re = new RegExp(`\\b${varName}\\b`, 'g');
-  const snippets = new Set();
+  const candidates = [];
   let m;
-  while ((m = re.exec(source)) !== null && snippets.size < maxOcc) {
-    const start = Math.max(0, m.index - radius);
-    const end   = Math.min(source.length, m.index + varName.length + radius);
-    const snip  = source.slice(start, end).trim().replace(/\s+/g, ' ').slice(0, 240);
-    snippets.add(snip);
+  while ((m = re.exec(source)) !== null) {
+    const idx   = m.index;
+    const after = idx + varName.length;
+    // Prefer high-signal sites: assignment RHS, call args, property access
+    // +2 if preceded by =, (, or ,  (RHS / argument position)
+    // +1 if followed by . or (       (object access / callee)
+    const precChar   = source.slice(0, idx).trimEnd().slice(-1);
+    const followChar = source[after] ?? '';
+    const score = (/[=,(]/.test(precChar) ? 2 : 0) + (/[.(]/.test(followChar) ? 1 : 0);
+    const start = Math.max(0, idx - radius);
+    const end   = Math.min(source.length, after + radius);
+    const snip  = source.slice(start, end).trim().replace(/\s+/g, ' ').slice(0, 400);
+    candidates.push({ snip, score });
   }
-  return [...snippets].join(' | ');
+  // Sort by score desc so high-signal occurrences come first; deduplicate
+  candidates.sort((a, b) => b.score - a.score);
+  const seen = new Set();
+  const snippets = [];
+  for (const { snip } of candidates) {
+    if (!seen.has(snip) && snippets.length < maxOcc) {
+      seen.add(snip);
+      snippets.push(snip);
+    }
+  }
+  return snippets.join(' | ');
 }
 
 // ── Phase 1: Initializer scoring ──────────────────────────────────────────────
@@ -2789,7 +2807,7 @@ export function loadSeeds(filePath) {
 export async function buildRenameMap(source, opts = {}) {
   const {
     llm           = !!process.env.GH_TOKEN,
-    llmBatchSize  = 15,
+
     workers       = source.length > 200_000 && source.length < 3_000_000,
     minConfidence = 3,
     seedsFile     = null,
@@ -4010,6 +4028,7 @@ export async function buildRenameMap(source, opts = {}) {
       // Get model profile for batch sizing (Opus = 300 vars/batch, gpt-4o-mini = 40)
       const profile = await getActiveProfile();
       const batchSize = opts.llmBatchSize ?? profile.batchSize;
+      // Opus=200, Sonnet=150, gpt-4o=100, gpt-4o-mini=40 — auto-tuned from model
 
       // Rank uncertain vars by usage count — most-used vars first
       let prioritized = uncertain;
@@ -4029,7 +4048,7 @@ export async function buildRenameMap(source, opts = {}) {
       for (let i = 0; i < toName.length; i += batchSize) {
         const batch = toName.slice(i, i + batchSize).map(name => ({
           name,
-          context: extractContextMulti(source, name, 3, 500),
+          context: extractContextMulti(source, name),
         }));
         try {
           const llmMap = await llmNameBatch(batch);

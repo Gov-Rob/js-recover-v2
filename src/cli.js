@@ -60,7 +60,6 @@ export function createCommand() {
     .option('--seeds <file>',            'JSON file of {mangled: semantic} seed mappings for this bundle')
     .option('--llm',                     'Enable GitHub Copilot LLM naming pass (requires GH_TOKEN)')
     .option('--llm-max <n>',             'Max uncertain vars to send to LLM', '300')
-    .option('--llm-batch <n>',           'LLM batch size per API call', '15')
     .option('--no-workers',              'Disable worker thread math analysis')
     .option('--graph',                   'Enable HelixHyper graph pipeline (community detection + propagation)')
     .option('--graph-seeds <n>',         'LLM seeds per cluster in graph pass', '3')
@@ -70,7 +69,6 @@ export function createCommand() {
         ...opts,
         llm:         opts.llm ?? !!process.env.GH_TOKEN,
         llmMaxVars:  parseInt(opts.llmMax ?? '300', 10),
-        llmBatchSize:parseInt(opts.llmBatch ?? '15', 10),
         workers:     opts.workers !== false,
         graph:       opts.graph ?? false,
         graphSeeds:  parseInt(opts.graphSeeds ?? '3', 10),
