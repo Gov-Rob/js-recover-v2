@@ -1,0 +1,44 @@
+{
+  "name": "js-recover",
+  "version": "2.0.0",
+  "description": "Enterprise JS deobfuscator — AST-based semantic renaming, bundle splitting, symbol indexing. Seeds loaded from external JSON files.",
+  "type": "module",
+  "bin": {
+    "js-recover": "./bin/cli.js"
+  },
+  "scripts": {
+    "test": "node tests/run.js",
+    "lint": "node --check src/**/*.js bin/cli.js",
+    "gap:extract": "node src/llm/extract-uncertain.mjs",
+    "gap:prep": "node src/llm/prep-batches.mjs",
+    "gap:inject": "node src/llm/inject-seeds.mjs",
+    "gap:pipeline": "node src/llm/run-pipeline.mjs",
+    "gap:bench": "node --input-type=module -e \"import('./src/passes/renamer.js').then(async ({buildRenameMap})=>{const {readFileSync}=await import('fs');const src=readFileSync('/root/copilot-src/app.stripped.js','utf8');const {stats}=await buildRenameMap(src,{llm:false,workers:false});console.log(stats.static+'/'+stats.bindings+' = '+(stats.static/stats.bindings*100).toFixed(1)+'%');})\""
+  },
+  "dependencies": {
+    "acorn": "^8.11.3",
+    "acorn-walk": "^8.3.2",
+    "chalk": "^5.3.0",
+    "commander": "^12.0.0",
+    "js-beautify": "^1.15.4",
+    "ora": "^8.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "deobfuscate",
+    "deminify",
+    "decompile",
+    "source-recovery",
+    "webpack",
+    "esbuild",
+    "rollup"
+  ],
+  "author": "ChaozCode",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Gov-Rob/js-recover-v2.git"
+  }
+}

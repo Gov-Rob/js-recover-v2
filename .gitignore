@@ -1,0 +1,10 @@
+node_modules/
+recovered/
+modules/
+*.pretty.js
+*.renamed.js
+*.rename-map.json
+*.symbols.json
+*.SYMBOLS.md
+recovery-report.json
+.DS_Store
