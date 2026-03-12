@@ -233,8 +233,8 @@ function scoreInit(init) {
         }
 
         // Mine name hints from an anonymous ClassExpression body:
-        // 1) Method names ≥6 chars (priority 7)
-        // 2) Constructor this.propName assignments ≥7 chars (priority 6)
+        // 1) Method names ≥5 chars (priority 7)
+        // 2) Constructor this.propName assignments ≥6 chars (priority 6)
         // 3) Extends class name (priority 5)
         function mineAnonymousClass(cls) {
           const body = cls.body?.body ?? [];
@@ -245,7 +245,7 @@ function scoreInit(init) {
           for (const m of body) {
             if (m.type !== 'MethodDefinition' && m.type !== 'PropertyDefinition') continue;
             const mname = m.key?.name;
-            if (mname && mname.length >= 6 && /^[a-z][a-zA-Z0-9]+$/.test(mname) && !GENERIC_METHODS.has(mname)) {
+            if (mname && mname.length >= 5 && /^[a-z][a-zA-Z0-9]+$/.test(mname) && !GENERIC_METHODS.has(mname)) {
               return { name: `${mname}Cls`, priority: 7 };
             }
           }
@@ -262,7 +262,7 @@ function scoreInit(init) {
                     expr.left?.type === 'MemberExpression' &&
                     expr.left.object?.type === 'ThisExpression') {
                   const pname = expr.left.property?.name;
-                  if (pname && pname.length >= 7 && !pname.startsWith('_') && !GENERIC_KEYS.has(pname)) {
+                  if (pname && pname.length >= 6 && !pname.startsWith('_') && !GENERIC_KEYS.has(pname)) {
                     return { name: `${pname}Cls`, priority: 6 };
                   }
                 }
@@ -453,6 +453,69 @@ function scoreInit(init) {
                   const cname = best.replace(/[^a-zA-Z0-9]+([a-zA-Z])/g, (_,c)=>c.toUpperCase())
                                  .replace(/^[^a-zA-Z]*/, '').replace(/[^a-zA-Z0-9]/g,'');
                   if (cname.length >= 4) candidates.push({ name: `${cname.charAt(0).toLowerCase()+cname.slice(1)}Types`, priority: 4 });
+                }
+              }
+            }
+          }
+
+          // ExpressionStatement with IIFE: (function(t){t.key="val",...})(x||(x={}))
+          // TypeScript enum compilation pattern — extract first key as name hint
+          // Handles IIFE: (function(t){t.key="val",...})(x||(x={}))
+          // Bodies often use comma-expressions (SequenceExpression) not separate statements
+          if (node.type === 'ExpressionStatement' &&
+              node.expression?.type === 'CallExpression') {
+            const iifeCallee = node.expression.callee;
+            if (iifeCallee?.type === 'FunctionExpression' && iifeCallee.params?.length === 1) {
+              const iifeBody = iifeCallee.body?.body ?? [];
+              const tParam = iifeCallee.params[0]?.name;
+              let foundEnumKey = false;
+              for (const stmt of iifeBody) {
+                if (foundEnumKey) break;
+                if (stmt?.type !== 'ExpressionStatement') continue;
+                const stmtExpr = stmt.expression;
+                // Unwrap SequenceExpression (comma-separated assignments within same statement)
+                const exprs = stmtExpr?.type === 'SequenceExpression'
+                  ? stmtExpr.expressions : [stmtExpr];
+                for (const expr of exprs) {
+                  if (!expr || expr.type !== 'AssignmentExpression') continue;
+                  // Pattern 1: t.key = "value" (string property enum)
+                  if (expr.left?.type === 'MemberExpression' &&
+                      expr.left.object?.name === tParam &&
+                      !expr.left.computed) {
+                    const key = expr.left.property?.name;
+                    if (key && key.length >= 5) {
+                      candidates.push({ name: `${key.charAt(0).toLowerCase()+key.slice(1)}Enum`, priority: 7 });
+                      foundEnumKey = true; break;
+                    }
+                  }
+                  // Pattern 2: t[t.Key=N]="Key" (numeric enum with reverse mapping)
+                  if (expr.right?.type === 'Literal' &&
+                      typeof expr.right.value === 'string' &&
+                      expr.right.value.length >= 3 &&
+                      /^[A-Z]/.test(expr.right.value)) {
+                    const keyStr = expr.right.value;
+                    candidates.push({ name: `${keyStr.charAt(0).toLowerCase()+keyStr.slice(1)}Enum`, priority: 7 });
+                    foundEnumKey = true; break;
+                  }
+                }
+              }
+            }
+          }
+
+          // Object assignment with numeric keys and descriptive value props: {1:obj.SHOW_ELEMENT,...}
+          if (node.type === 'AssignmentExpression' &&
+              node.left?.type === 'Identifier' &&
+              node.right?.type === 'ObjectExpression') {
+            const props = node.right.properties ?? [];
+            const numProps = props.filter(p => p.key?.type === 'Literal' && typeof p.key.value === 'number');
+            if (numProps.length >= 2) {
+              for (const prop of numProps) {
+                const valProp = prop.value?.property?.name ?? prop.value?.name;
+                if (valProp && valProp.length >= 6 && /^[A-Z_]{3,}/.test(valProp)) {
+                  // SHOW_ELEMENT → showElement; FORWARDS → forwards
+                  const cname = valProp.toLowerCase().replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+                  candidates.push({ name: `${cname}Map`, priority: 5 });
+                  break;
                 }
               }
             }
@@ -3321,8 +3384,314 @@ export async function buildRenameMap(source, opts = {}) {
     uncertain.push(...stillUncertain1);
   }
 
-  // Phase 4: Copilot LLM for uncertain variables
-  // Auto-selects best model (Opus 4.6 preferred) and tunes batch size to its context window.
+  // Phase 3.6: Oe/interop wrapper propagation
+  // Pattern: x = Oe(namedFn(), 1) → x inherits namedFn's semantic name with "Interop" suffix.
+  // Oe() is a common ESM interop helper (adds __esModule marker). The inner call returns the real module.
+  // This fixes ~123 uncertain vars in the Copilot bundle.
+  {
+    const oeUncertain = new Set(uncertain);
+    let oeCount = 0;
+    walk.simple(ast, {
+      VariableDeclarator(node) {
+        const v = node.id?.name;
+        if (!v || !oeUncertain.has(v) || map[v]) return;
+        const init = node.init;
+        if (init?.type !== 'CallExpression') return;
+        const calleeName = init.callee?.name;
+        if (!calleeName || calleeName.length > 4) return; // only short helper names (Oe, _e, etc.)
+        const firstArg = init.arguments?.[0];
+        if (firstArg?.type !== 'CallExpression') return;
+        const innerCallee = firstArg.callee?.name;
+        if (!innerCallee || !map[innerCallee]) return;
+        // Propagate the inner function's name with a clean suffix
+        let srcName = map[innerCallee].replace(/_\d+$/, ''); // strip trailing _N dedup suffix
+        // Strip generic suffixes (Mod, Cls, Obj) to get the semantic core
+        const core = srcName.replace(/(?:Mod|Cls|Obj|Fn|_2|_3)$/, '') || srcName;
+        map[v] = unique(core + 'Interop');
+        oeCount++;
+      }
+    });
+    if (oeCount > 0) {
+      const stillUncertain = uncertain.filter(v => !map[v]);
+      uncertain.length = 0;
+      uncertain.push(...stillUncertain);
+      if (process.env.DEBUG) console.error(`[phase-3.6] Oe interop propagation: +${oeCount}`);
+    }
+  }
+
+  // Phase 3.7: String-arg factory pattern extraction
+  // Handles Ce("module") → moduleModule, g1(icon,"Label") → labelIcon,
+  // Oke(icon,"Disp","camelId") → camelId, require("fs") → fsModule,
+  // f0s(Object.keys, Object) → objectKeysFunc, PKt(base,"Map") → mapCls, etc.
+  {
+    const unc37 = new Set(uncertain);
+    let count37 = 0;
+    const toCamel = s => s.replace(/[\s-_]+([a-z])/gi, (_,c) => c.toUpperCase())
+      .replace(/^[A-Z]/, c => c.toLowerCase()).replace(/[^a-zA-Z0-9]/g,'');
+    walk.simple(ast, {
+      VariableDeclarator(node) {
+        const v = node.id?.name;
+        if (!v || !unc37.has(v) || map[v]) return;
+        const init = node.init;
+        if (!init || init.type !== 'CallExpression') return;
+        const callee = init.callee;
+        const args = init.arguments ?? [];
+        const calleeName = callee?.name;
+
+        // Pattern A: Ce("moduleName") or require("moduleName") → moduleNameModule
+        if ((calleeName === 'require' || (calleeName && calleeName.length <= 3 &&
+             args.length === 1 && args[0]?.type === 'Literal' && typeof args[0].value === 'string')) &&
+            args[0]?.type === 'Literal' && typeof args[0].value === 'string') {
+          const mod = args[0].value;
+          if (mod && /^[a-z]/.test(mod) && mod.length >= 2 && mod.length <= 30 && !mod.includes('/')) {
+            const safe = toCamel(mod.replace(/[^a-zA-Z0-9\s]/g,''));
+            if (safe.length >= 2) {
+              map[v] = unique(safe + 'Module');
+              count37++;
+              return;
+            }
+          }
+        }
+
+        // Pattern B: g1(iconConst, "Label") → labelIcon  (icon factory with string label 2nd arg)
+        if (args.length >= 2 && args[1]?.type === 'Literal' && typeof args[1].value === 'string') {
+          const label = args[1].value;
+          if (label.length >= 3 && label.length <= 25 && /^[A-Za-z]/.test(label)) {
+            const safeLbl = toCamel(label.replace(/[^a-zA-Z0-9\s]/g,''));
+            if (safeLbl.length >= 3) {
+              map[v] = unique(safeLbl + 'Icon');
+              count37++;
+              return;
+            }
+          }
+        }
+
+        // Pattern C: Oke(iconConst, "Display", "camelCaseId") → use 3rd arg directly
+        if (args.length >= 3 && args[2]?.type === 'Literal' && typeof args[2].value === 'string') {
+          const id = args[2].value;
+          if (id.length >= 4 && /^[a-z][a-zA-Z0-9]+$/.test(id)) {
+            map[v] = unique(id);
+            count37++;
+            return;
+          }
+        }
+
+        // Pattern D: f0s(Object.keys, Object) / mfs(Object.getPrototypeOf, Object)
+        // First arg is MemberExpression like Object.keys
+        if (args.length >= 1 && args[0]?.type === 'MemberExpression' &&
+            !args[0].computed && args[0].object?.name && args[0].property?.name) {
+          const obj = args[0].object.name;
+          const prop = args[0].property.name;
+          if (['Object','Array','Function','Math','String','Number','Date','RegExp','Promise','Reflect','Proxy'].includes(obj)) {
+            const safeProp = prop.replace(/^get/, '').replace(/^[A-Z]/, c => c.toLowerCase());
+            map[v] = unique(obj.toLowerCase() + safeProp.charAt(0).toUpperCase() + safeProp.slice(1) + 'Func');
+            count37++;
+            return;
+          }
+        }
+
+        // Pattern E: PKt(base, "TypeName") / constructor wrappers with named string type
+        if (args.length >= 2 && args[1]?.type === 'Literal' && typeof args[1].value === 'string') {
+          const typeName = args[1].value;
+          if (typeName.length >= 3 && typeName.length <= 20 && /^[A-Z][a-zA-Z]+$/.test(typeName)) {
+            const safe = typeName.charAt(0).toLowerCase() + typeName.slice(1);
+            map[v] = unique(safe + 'Cls');
+            count37++;
+          }
+        }
+      }
+    });
+    if (count37 > 0) {
+      const stillUncertain = uncertain.filter(v => !map[v]);
+      uncertain.length = 0;
+      uncertain.push(...stillUncertain);
+      if (process.env.DEBUG) console.error(`[phase-3.7] String-arg factory extraction: +${count37}`);
+    }
+  }
+
+  // Phase 3.8: Second-pass alias propagation (catches vars that became nameable after Phase 3.6)
+  // Vars initialized as `x = y` where y was uncertain in Phase 3.5 but is now named (via Oe propagation).
+  {
+    let count38 = 0;
+    const unc38 = new Set(uncertain);
+    walk.simple(ast, {
+      VariableDeclarator(node) {
+        const v = node.id?.name;
+        if (!v || !unc38.has(v) || map[v]) return;
+        const init = node.init;
+        if (!init) return;
+        // Direct alias: x = y
+        if (init.type === 'Identifier' && map[init.name]) {
+          map[v] = unique(map[init.name]);
+          count38++;
+        }
+        // x = y.default (ESM re-export)
+        else if (init.type === 'MemberExpression' && !init.computed &&
+                 init.property?.name === 'default' && map[init.object?.name]) {
+          map[v] = unique(map[init.object.name].replace(/Module$/,'') + 'Default');
+          count38++;
+        }
+      }
+    });
+    if (count38 > 0) {
+      const stillUncertain = uncertain.filter(v => !map[v]);
+      uncertain.length = 0;
+      uncertain.push(...stillUncertain);
+      if (process.env.DEBUG) console.error(`[phase-3.8] 2nd-pass alias propagation: +${count38}`);
+    }
+  }
+
+  // Phase 3.9: Factory-body Oe assignments to null-init vars
+  // Pattern: `x = Oe(namedFn(), 1)` inside factory bodies (var x is declared null at top level)
+  // These are ESM interop wrappers for pre-declared module vars.
+  // We walk all AssignmentExpression nodes (not just VariableDeclarators) to find these.
+  {
+    const unc39 = new Set(uncertain);
+    let count39 = 0;
+    walk.simple(ast, {
+      AssignmentExpression(node) {
+        if (node.operator !== '=') return;
+        const lhs = node.left;
+        if (lhs.type !== 'Identifier') return;
+        const v = lhs.name;
+        if (!v || !unc39.has(v) || map[v]) return;
+        const rhs = node.right;
+        if (rhs?.type !== 'CallExpression') return;
+        const calleeName = rhs.callee?.name;
+        if (!calleeName || calleeName.length > 4) return; // short Oe-like wrapper
+        const firstArg = rhs.arguments?.[0];
+        if (firstArg?.type !== 'CallExpression') return;
+        const innerCallee = firstArg.callee?.name;
+        if (!innerCallee || !map[innerCallee]) return;
+        let srcName = map[innerCallee].replace(/_\d+$/, '');
+        const core = srcName.replace(/(?:Mod|Cls|Obj|Fn|_2|_3)$/, '') || srcName;
+        map[v] = unique(core + 'Interop');
+        count39++;
+      }
+    });
+    if (count39 > 0) {
+      const stillUncertain = uncertain.filter(v => !map[v]);
+      uncertain.length = 0;
+      uncertain.push(...stillUncertain);
+      if (process.env.DEBUG) console.error(`[phase-3.9] Factory-body Oe assignments: +${count39}`);
+    }
+  }
+
+  // Phase 3.10: MemberExpression property name extraction for uncertain vars
+  // Pattern: `x = obj.longPropertyName` where property ≥7 chars is semantic
+  // Avoids overwriting shorter vars that appear in many contexts.
+  {
+    const unc310 = new Set(uncertain);
+    let count310 = 0;
+    const GENERIC_PROPS = new Set(['length','prototype','constructor','toString','valueOf',
+      'default','exports','arguments','caller','name','bind','call','apply',
+      'then','catch','finally','next','return','throw','done','value',
+      'get','set','has','add','delete','clear','size','keys','values','entries',
+      'push','pop','shift','unshift','splice','slice','join','map','filter','reduce',
+      'includes','indexOf','find','findIndex','some','every','flat','flatMap','sort']);
+    // Only name vars that appear as a UNIQUE minified name (not 2-char recycled)
+    const seen310 = new Map(); // var → candidate name (false if conflict)
+    walk.simple(ast, {
+      VariableDeclarator(node) {
+        const v = node.id?.name;
+        if (!v || !unc310.has(v) || map[v]) return;
+        const init = node.init;
+        if (!init || init.type !== 'MemberExpression' || init.computed) return;
+        const prop = init.property?.name;
+        if (!prop || prop.length < 7 || GENERIC_PROPS.has(prop)) return;
+        const candidate = prop.charAt(0).toLowerCase() + prop.slice(1) + 'Val';
+        if (seen310.has(v)) {
+          // Multiple declarations of same var — conflict, skip
+          if (seen310.get(v) !== candidate) seen310.set(v, false);
+        } else {
+          seen310.set(v, candidate);
+        }
+      }
+    });
+    for (const [v, name] of seen310) {
+      if (name && unc310.has(v) && !map[v]) {
+        map[v] = unique(name);
+        count310++;
+      }
+    }
+    if (count310 > 0) {
+      const stillUncertain = uncertain.filter(v => !map[v]);
+      uncertain.length = 0;
+      uncertain.push(...stillUncertain);
+      if (process.env.DEBUG) console.error(`[phase-3.10] MemberExpr property names: +${count310}`);
+    }
+  }
+
+  // Phase 3.11: Factory-body call assignments to null-init vars (non-Oe)
+  // Pattern: `x = namedFn(arg)` where x is null-init uncertain and namedFn is in map
+  // Also handles `Buffer.allocUnsafe(n)`, `Object.preventExtensions({})` etc.
+  {
+    const unc311 = new Set(uncertain);
+    let count311 = 0;
+    const GLOBAL_HINTS = new Map([
+      ['allocUnsafe', 'emptyBuffer'], ['allocUnsafeSlow', 'slowBuffer'],
+      ['allocUnsafe', 'allocUnsafeBuffer'], ['preventExtensions', 'frozenObj'],
+      ['defineProperties', 'definedProps'], ['create', 'createdObj'],
+      ['freeze', 'frozenObj'], ['seal', 'sealedObj'],
+      ['inverse', 'inverseColor'], ['libvipsVersion', 'libvipsVersion'],
+    ]);
+    walk.simple(ast, {
+      AssignmentExpression(node) {
+        if (node.operator !== '=') return;
+        const v = node.left?.name;
+        if (!v || !unc311.has(v) || map[v]) return;
+        const rhs = node.right;
+        if (!rhs || rhs.type !== 'CallExpression') return;
+
+        // A: x = namedFn(args) where namedFn is in map (any named callee)
+        if (rhs.callee?.type === 'Identifier' && map[rhs.callee.name]) {
+          const calleeName = rhs.callee.name;
+          let srcName = map[calleeName].replace(/_\d+$/, '');
+          const core = srcName.replace(/(?:Mod|Cls|Obj|Fn|Interop|_2|_3)$/, '') || srcName;
+          if (core.length >= 3) {
+            map[v] = unique(core + 'Result');
+            count311++;
+            return;
+          }
+        }
+
+        // B: x = Global.method(args) where method gives semantic info
+        if (rhs.callee?.type === 'MemberExpression' && !rhs.callee.computed) {
+          const obj = rhs.callee.object?.name;
+          const method = rhs.callee.property?.name;
+          if (!method || !obj) return;
+          // Well-known global patterns
+          if (obj === 'Buffer' && method === 'allocUnsafe') {
+            map[v] = unique('allocUnsafeBuffer'); count311++; return;
+          }
+          if (obj === 'Object' && method === 'preventExtensions') {
+            map[v] = unique('preventExtensionsObj'); count311++; return;
+          }
+          if (obj === 'Object' && method === 'defineProperties') {
+            map[v] = unique('definedPropertiesObj'); count311++; return;
+          }
+          // Generic: if method ≥10 chars, use it
+          if (method.length >= 10 && !['constructor','toString'].includes(method)) {
+            map[v] = unique(method.charAt(0).toLowerCase() + method.slice(1) + 'Result');
+            count311++; return;
+          }
+          // If receiver is named in map
+          if (obj && map[obj] && method.length >= 4) {
+            const objCore = map[obj].replace(/_\d+$/, '').replace(/(?:Mod|Cls|Obj|Fn|Interop)$/,'');
+            const methCap = method.charAt(0).toUpperCase() + method.slice(1);
+            map[v] = unique(objCore + methCap);
+            count311++; return;
+          }
+        }
+      }
+    });
+    if (count311 > 0) {
+      const stillUncertain = uncertain.filter(v => !map[v]);
+      uncertain.length = 0;
+      uncertain.push(...stillUncertain);
+      if (process.env.DEBUG) console.error(`[phase-3.11] Factory-body call assign: +${count311}`);
+    }
+  }
   let llmCount = 0;
   const llmMaxVars = opts.llmMaxVars ?? Infinity; // no cap by default — model limits itself
 
