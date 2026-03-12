@@ -639,6 +639,18 @@ const TYPE_NAMES = {
   // Phase 2g types
   errClass:'ErrClass',  subClass:'SubClass', classDef:'ClassDef',
   namedSym:'sym',       symbol:'sym',
+  // Class method-derived hints (v6.1)
+  Connector:'Connector', Parser:'Parser',     Serializer:'Serializer',
+  Validator:'Validator', Transformer:'Transformer', Compiler:'Compiler',
+  Encoder:'Encoder',     Decoder:'Decoder',   Cipher:'Cipher',
+  Hasher:'Hasher',       Signer:'Signer',     Verifier:'Verifier',
+  Handler:'Handler',     Dispatcher:'Dispatcher', Router:'Router',
+  Renderer:'Renderer',   Scheduler:'Scheduler', Migrator:'Migrator',
+  Listener:'Listener',   Publisher:'Publisher', Subscriber:'Subscriber',
+  Streamer:'Streamer',   Pipeline:'Pipeline',
+  AuthProvider:'AuthProvider', Authorizer:'Authorizer',
+  Resolver:'Resolver',   Retrier:'Retrier',   Throttler:'Throttler',
+  Cache:'Cache',         Indexer:'Indexer',
 };
 
 // Event name → handler name (for fn(eventStr, minVar) patterns)
@@ -2047,11 +2059,37 @@ export async function buildRenameMap(source, opts = {}) {
       const superName = node.superClass?.name;
       const ERROR_BASES = new Set(['Error','TypeError','RangeError','SyntaxError',
         'ReferenceError','URIError','EvalError','AggregateError']);
+
+      // Infer purpose from method names (e.g. connect/parse/emit → Connector/Parser/Emitter)
+      const CLASS_METHOD_HINTS = new Map([
+        ['connect','Connector'],   ['parse','Parser'],      ['serialize','Serializer'],
+        ['validate','Validator'],  ['transform','Transformer'],['compile','Compiler'],
+        ['encode','Encoder'],      ['decode','Decoder'],    ['encrypt','Cipher'],
+        ['decrypt','Cipher'],      ['hash','Hasher'],       ['sign','Signer'],
+        ['verify','Verifier'],     ['handle','Handler'],    ['dispatch','Dispatcher'],
+        ['route','Router'],        ['render','Renderer'],   ['schedule','Scheduler'],
+        ['migrate','Migrator'],    ['listen','Listener'],   ['publish','Publisher'],
+        ['subscribe','Subscriber'],['stream','Streamer'],   ['pipeline','Pipeline'],
+        ['authenticate','AuthProvider'],['authorize','Authorizer'],
+        ['resolve','Resolver'],    ['reject','Rejector'],   ['retry','Retrier'],
+        ['throttle','Throttler'],  ['cache','Cache'],       ['index','Indexer'],
+      ]);
+      const methods = node.body?.body
+        ?.filter(m => m.type === 'MethodDefinition' && m.key?.type === 'Identifier')
+        .map(m => m.key.name) ?? [];
+      let classHint = null;
+      for (const method of methods) {
+        if (CLASS_METHOD_HINTS.has(method)) { classHint = CLASS_METHOD_HINTS.get(method); break; }
+      }
+
       // Error subclass: class Xcn extends Error { ... }
       if (superName && ERROR_BASES.has(superName)) {
         if (9 > b.initScore) { b.initName = 'errClass'; b.initScore = 9; }
+      } else if (classHint) {
+        // Semantically rich class (has connect/parse/handle/etc method) — use method-derived hint
+        if (8 > b.initScore) { b.initName = classHint; b.initScore = 8; }
       } else if (superName) {
-        // Extends some other (possibly minified) class — still a class definition
+        // Extends some other class
         if (8 > b.initScore) { b.initName = 'subClass'; b.initScore = 8; }
       } else {
         if (7 > b.initScore) { b.initName = 'classDef'; b.initScore = 7; }
