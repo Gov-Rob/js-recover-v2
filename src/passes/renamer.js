@@ -214,28 +214,90 @@ function scoreInit(init) {
         // CJS pattern: S((exports, module) => {...})
         // First param = exports object; assignments to exports.key are the module's public API
         const exportsParam = factory.params?.[0]?.name;
+        // Second param = module object; assignments to module.exports are also the public API
+        const moduleParam = factory.params?.[1]?.name;
         
         const candidates = []; // {name, priority}
+
+        // Extract best key from an ObjectExpression node (priority 7+)
+        function bestObjKey(objNode) {
+          if (objNode?.type !== 'ObjectExpression') return null;
+          for (const prop of objNode.properties || []) {
+            if (prop.type !== 'Property') continue;
+            const k = prop.key?.name ?? prop.key?.value;
+            if (typeof k === 'string' && k.length >= 6 && !GENERIC_KEYS.has(k)) {
+              return k.charAt(0).toLowerCase() + k.slice(1);
+            }
+          }
+          return null;
+        }
         
         // Recursive AST walk to find CJS export patterns deeply nested in body
         function walkForExports(node, depth) {
           if (!node || typeof node !== 'object' || depth > 8) return;
           // Don't descend into nested function scopes (inner functions have own exports)
           if (depth > 0 && (node.type === 'FunctionExpression' || node.type === 'ArrowFunctionExpression')) return;
+
+          // Class declaration: class SomeName extends ... → high confidence name
+          if (node.type === 'ClassDeclaration' || node.type === 'ClassExpression') {
+            const cname = node.id?.name;
+            if (cname && /^[A-Z]/.test(cname)) {
+              candidates.push({ name: `${cname.charAt(0).toLowerCase()+cname.slice(1)}Cls`, priority: 8 });
+            }
+          }
+
+          // Named function declaration: function doThing() {...} → descriptive
+          if (node.type === 'FunctionDeclaration') {
+            const fname = node.id?.name;
+            // Only use if it looks like a real descriptive name (not a minified one)
+            if (fname && fname.length >= 5 && /^[a-z][a-zA-Z0-9_]+$/.test(fname)) {
+              candidates.push({ name: `${fname}Fn`, priority: 5 });
+            }
+          }
           
           if (node.type === 'AssignmentExpression') {
             if (node.left?.type === 'MemberExpression' &&
                 node.left.property?.type === 'Identifier') {
               const key = node.left.property.name;
               const obj = node.left.object?.name;
-              // CJS export: exportsParam.longKey = val
+              // CJS export via first param: exportsParam.longKey = val
               if (exportsParam && obj === exportsParam && key.length >= 5 && !GENERIC_KEYS.has(key)) {
                 const kname = key.charAt(0).toLowerCase() + key.slice(1);
                 candidates.push({ name: `${kname}Mod`, priority: 8 });
               }
-              // Generic: obj.longKey = val (any nesting)
+              // CJS export via module.exports: moduleParam.exports = {key:val,...}
+              else if (moduleParam && obj === moduleParam && key === 'exports') {
+                const objKey = bestObjKey(node.right);
+                if (objKey) {
+                  candidates.push({ name: `${objKey}Mod`, priority: 9 });
+                } else if (node.right?.type === 'ClassExpression' && node.right.id?.name) {
+                  const cname = node.right.id.name;
+                  candidates.push({ name: `${cname.charAt(0).toLowerCase()+cname.slice(1)}Cls`, priority: 9 });
+                } else if (node.right?.type === 'CallExpression') {
+                  // module.exports = someFactory() → not very useful, skip
+                }
+              }
+              // Any var.exports = {key:val,...} pattern (fallback — some bundlers use different param names)
+              else if (key === 'exports' && obj && node.right?.type === 'ObjectExpression') {
+                const objKey = bestObjKey(node.right);
+                if (objKey) candidates.push({ name: `${objKey}Mod`, priority: 6 });
+              }
+              // Generic: obj.longKey = val — use object key as name hint
               else if (key.length >= 5 && !GENERIC_KEYS.has(key)) {
                 candidates.push({ name: `${key.charAt(0).toLowerCase()+key.slice(1)}Mod`, priority: 4 });
+              }
+            }
+            // Assignment to var with object literal: someVar = {longKey: val, ...}
+            // Signals the factory is initializing an object with descriptive structure
+            else if (node.left?.type === 'Identifier' && node.right?.type === 'ObjectExpression') {
+              const objKey = bestObjKey(node.right);
+              if (objKey) candidates.push({ name: `${objKey}Obj`, priority: 5 });
+            }
+            // Assignment to var with class: someVar = class ClassName {...}
+            else if (node.left?.type === 'Identifier' && node.right?.type === 'ClassExpression') {
+              const cname = node.right.id?.name;
+              if (cname && /^[A-Z]/.test(cname)) {
+                candidates.push({ name: `${cname.charAt(0).toLowerCase()+cname.slice(1)}Cls`, priority: 8 });
               }
             }
           }
@@ -271,6 +333,16 @@ function scoreInit(init) {
                 if (typeof sym === 'string' && sym.length >= 3) {
                   candidates.push({ name: `sym_${toIdentifier(sym).slice(0,20)}`, priority: 6 });
                 }
+              }
+              // var x = class ClassName {...}
+              if (init.type === 'ClassExpression' && init.id?.name && /^[A-Z]/.test(init.id.name)) {
+                const cname = init.id.name;
+                candidates.push({ name: `${cname.charAt(0).toLowerCase()+cname.slice(1)}Cls`, priority: 8 });
+              }
+              // var x = {longKey: val, ...} — object initialization with descriptive keys
+              if (init.type === 'ObjectExpression') {
+                const objKey = bestObjKey(init);
+                if (objKey) candidates.push({ name: `${objKey}Obj`, priority: 5 });
               }
             }
           }
