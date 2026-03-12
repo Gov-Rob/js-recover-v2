@@ -1,13 +1,16 @@
 /**
- * js-recover — Renamer pass (v5)
+ * js-recover — Renamer pass (v6)
  *
- * Five-phase pipeline:
+ * Seven-phase pipeline:
  *   Phase 1 — INIT analysis     (what is this variable initialized to?)
  *   Phase 2 — USAGE analysis    (single-pass O(n) — how is it used?)
  *   Phase 2b— SHAPE analysis    (what properties are read from this var?)
  *   Phase 2c— DESTRUCT analysis (what keys are destructured out of this var?)
  *   Phase 2d— CALL-ARG analysis (what type is inferred from call-site position?)
  *   Phase 2e— ALIAS analysis   (type propagation via assignment aliasing)
+ *   Phase 2f— RETURN TYPE      (function return type inference + propagation)
+ *   Phase 2g— SYMBOL ANALYSIS  (Symbol.for/Symbol keys, class declarations,
+ *                                RegExp patterns, string-literal semantics)
  *   Phase 3 — MATH analysis     (frequency rank, Terser sequence, entropy)
  *   Phase 4 — COPILOT LLM       (batch uncertain vars to GitHub Copilot)
  *   Phase 5 — HELIX GRAPH       (co-occurrence graph, community detection,
@@ -49,6 +52,74 @@ function toIdentifier(raw) {
   return /^[a-zA-Z_$]/.test(clean) ? clean : `_${clean}`;
 }
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * Convert a Symbol.for() key string to a clean identifier name.
+ * e.g. "undici.error.UND_ERR_CONNECT_TIMEOUT" → "sym_undici_connectTimeout"
+ *      "nodejs.rejection" → "sym_nodejsRejection"
+ */
+function symbolKeyToName(key) {
+  // Split on dots and underscores, camelCase the result
+  const parts = key.split(/[._\s-]+/).filter(Boolean);
+  if (!parts.length) return 'namedSym';
+  // Take up to last 3 meaningful segments (skip generic prefixes like 'err')
+  const meaningful = parts.filter(p => p.length > 1 && !/^(the|a|an|of|for|in|on|by)$/i.test(p));
+  const segments = meaningful.slice(-3);
+  if (!segments.length) return 'namedSym';
+  const camel = segments
+    .map((s, i) => {
+      const lower = s.toLowerCase().replace(/[^a-z0-9]/g, '');
+      return i === 0 ? lower : lower.charAt(0).toUpperCase() + lower.slice(1);
+    })
+    .join('');
+  return `sym_${camel.slice(0, 28)}`;
+}
+
+/**
+ * Convert a descriptive string literal to a semantic identifier name.
+ * e.g. "Connect Timeout Error" → "connectTimeoutMsg"
+ *      "connection closed"     → "connectionClosedMsg"
+ * Returns null if the string isn't descriptive enough.
+ */
+function stringLiteralToName(str) {
+  if (!str || str.length < 5 || str.length > 80) return null;
+  if (!/[a-zA-Z]{3}/.test(str)) return null; // mostly numbers/symbols
+  // Natural-language phrase (spaces)
+  if (/\s/.test(str)) {
+    const words = str.split(/\s+/).filter(w => /^[A-Za-z][a-z]{1,}$/.test(w));
+    if (words.length >= 2) {
+      const camel = words.slice(0, 3)
+        .map((w, i) => i === 0 ? w.toLowerCase() : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+        .join('');
+      return camel.slice(0, 30) + 'Msg';
+    }
+  }
+  // Path-like: /some/path → already handled upstream
+  // Short descriptive event/status names without spaces
+  if (/^[a-z][a-zA-Z0-9]{3,20}$/.test(str) && /[A-Z]|[_-]/.test(str)) {
+    return 'K_' + str.replace(/[^a-zA-Z0-9_]/g, '_').slice(0, 24);
+  }
+  return null;
+}
+
+/**
+ * Extract multiple occurrence snippets of `varName` from source for richer LLM context.
+ * Returns up to `maxOcc` distinct line-level snippets joined by ' | '.
+ */
+function extractContextMulti(source, varName, maxOcc = 3, radius = 500) {
+  const re = new RegExp(`\\b${varName}\\b`, 'g');
+  const snippets = new Set();
+  let m;
+  while ((m = re.exec(source)) !== null && snippets.size < maxOcc) {
+    const start = Math.max(0, m.index - radius);
+    const end   = Math.min(source.length, m.index + varName.length + radius);
+    const snip  = source.slice(start, end).trim().replace(/\s+/g, ' ').slice(0, 240);
+    snippets.add(snip);
+  }
+  return [...snippets].join(' | ');
+}
+
 // ── Phase 1: Initializer scoring ──────────────────────────────────────────────
 
 const HIGH_PRIO_CTORS = new Set([
@@ -70,6 +141,9 @@ function scoreInit(init) {
           return { name: 'K_' + v.slice(0, 24), score: 8 };
         if (/^[a-z][a-zA-Z0-9._-]{2,30}$/.test(v))
           return { name: 'K_' + toIdentifier(v).slice(0, 26), score: 7 };
+        // Descriptive natural-language message strings
+        const descName = stringLiteralToName(v);
+        if (descName) return { name: descName, score: 6 };
         // Fallback: any string literal → generic 'str' hint
         if (v.length >= 1) return { name: 'str', score: 3 };
       }
@@ -79,6 +153,8 @@ function scoreInit(init) {
           return { name: `N_${v}`, score: 3 };
         return { name: 'num', score: 3 }; // fallback for floats/large ints
       }
+      // RegExp literal: /pattern/ → regex signal
+      if (init.regex) return { name: 'rePattern', score: 5 };
       return null;
     }
 
@@ -120,6 +196,15 @@ function scoreInit(init) {
       if (callee?.name === 'require' && args?.[0]?.type === 'Literal') {
         const mod = String(args[0].value).split('/').pop().replace(/\W/g, '_');
         return { name: `mod_${mod.slice(0,20)}`, score: 9 };
+      }
+
+      // Symbol.for('key') — named shared symbol (score 9 — very reliable)
+      if (callee?.type === 'MemberExpression' &&
+          callee.object?.name === 'Symbol' &&
+          callee.property?.name === 'for') {
+        const key = args?.[0]?.value;
+        if (typeof key === 'string') return { name: symbolKeyToName(key), score: 9 };
+        return { name: 'namedSym', score: 7 };
       }
 
       // Symbol() — always a unique key/id
@@ -551,6 +636,9 @@ const TYPE_NAMES = {
   urlParams:'urlParams', weakMap:'weakMap',  weakSet:'weakSet',
   abortSignal:'abortSig', port:'port',       boolean:'bool',
   optional:'maybeVal', object:'obj',
+  // Phase 2g types
+  errClass:'ErrClass',  subClass:'SubClass', classDef:'ClassDef',
+  namedSym:'sym',       symbol:'sym',
 };
 
 // Event name → handler name (for fn(eventStr, minVar) patterns)
@@ -1952,6 +2040,32 @@ export async function buildRenameMap(source, opts = {}) {
         if (9 > b.initScore) { b.initName = 'err'; b.initScore = 9; }
       }
     },
+    // Class declarations — capture class name as a constructor binding
+    ClassDeclaration(node) {
+      if (node.id?.type !== 'Identifier') return;
+      const b = ensureBinding(node.id.name);
+      const superName = node.superClass?.name;
+      const ERROR_BASES = new Set(['Error','TypeError','RangeError','SyntaxError',
+        'ReferenceError','URIError','EvalError','AggregateError']);
+      // Error subclass: class Xcn extends Error { ... }
+      if (superName && ERROR_BASES.has(superName)) {
+        if (9 > b.initScore) { b.initName = 'errClass'; b.initScore = 9; }
+      } else if (superName) {
+        // Extends some other (possibly minified) class — still a class definition
+        if (8 > b.initScore) { b.initName = 'subClass'; b.initScore = 8; }
+      } else {
+        if (7 > b.initScore) { b.initName = 'classDef'; b.initScore = 7; }
+      }
+      // Handle constructor params as bindings (Pattern: constructor(msg, opts) {})
+      const ctor = node.body?.body?.find(m => m.type === 'MethodDefinition' && m.kind === 'constructor');
+      if (ctor) {
+        ctor.value?.params?.forEach(p => {
+          if (p.type === 'Identifier') ensureBinding(p.name);
+          else if (p.type === 'AssignmentPattern' && p.left?.type === 'Identifier')
+            ensureBinding(p.left.name);
+        });
+      }
+    },
   });
 
   // Phase 2: single-pass O(n) usage index
@@ -2030,6 +2144,9 @@ export async function buildRenameMap(source, opts = {}) {
     ['randomVal','number'],['parsedDate','date'],
     ['uuid','string'],    ['readStream','stream'],['writeStream','stream'],
     ['classDef','object'],['enabled','boolean'],['disabled','boolean'],
+    // Phase 2g additions
+    ['errClass','error'], ['subClass','ctor'],  ['rePattern','regex'],
+    ['namedSym','symbol'],
   ]);
 
   const typedVars = new Map();
@@ -2099,6 +2216,43 @@ export async function buildRenameMap(source, opts = {}) {
     }
   }
 
+  // Phase 2g: Symbol.for() / class / RegExp / string-literal dedicated pass
+  // This pass adds direct semantic names for patterns that Phase 1 handles via
+  // scoreInit(), but for situations where the binding was not visited yet or
+  // where a higher-confidence direct name should override the generic type hint.
+  // Specifically handles: Symbol.for() → symbolForName, class → errClass/subClass/classDef,
+  // RegExp /pattern/ → rePattern, and descriptive string literals → msgXxx names.
+  {
+    const PHASE2G_EXTRA_TYPES = new Map([
+      ['errClass','errClass'], ['subClass','classDef'], ['classDef','classDef'],
+      ['rePattern','regex'],
+    ]);
+    // Extend INIT_NAME_TO_TYPE for Phase 2g names
+    INIT_NAME_TO_TYPE.set('errClass','error');
+    INIT_NAME_TO_TYPE.set('subClass','ctor');
+    INIT_NAME_TO_TYPE.set('rePattern','regex');
+    INIT_NAME_TO_TYPE.set('namedSym','symbol');
+
+    // Walk AST to pick up any Symbol.for() we might have missed in Phase 1
+    // (e.g., in cases not covered by VariableDeclarator, like assignments in loops)
+    walk.simple(ast, {
+      AssignmentExpression(node) {
+        if (node.left?.type !== 'Identifier') return;
+        const { callee, arguments: args } = node.right ?? {};
+        if (callee?.type === 'MemberExpression' &&
+            callee.object?.name === 'Symbol' &&
+            callee.property?.name === 'for' &&
+            args?.[0]?.type === 'Literal' &&
+            typeof args[0].value === 'string') {
+          const b = bindings.get(node.left.name);
+          if (b) {
+            const symName = symbolKeyToName(args[0].value);
+            if (9 > b.initScore) { b.initName = symName; b.initScore = 9; }
+          }
+        }
+      },
+    });
+  }
 
   // Phase 3: parallel worker math analysis for large files
   let rankData = null, positional = null;
@@ -2274,7 +2428,7 @@ export async function buildRenameMap(source, opts = {}) {
       for (let i = 0; i < toName.length; i += batchSize) {
         const batch = toName.slice(i, i + batchSize).map(name => ({
           name,
-          context: extractContext(source, name, 12),
+          context: extractContextMulti(source, name, 3, 500),
         }));
         try {
           const llmMap = await llmNameBatch(batch);
