@@ -1127,6 +1127,70 @@ function nameFromShape(propsSet) {
 }
 
 // ── Destructuring Source Analysis ─────────────────────────────────────────────
+// ── Namespace Signature Detection ─────────────────────────────────────────────
+// Match vars whose property-access sets contain multiple keys from known
+// constant-name namespaces (HTTP methods, HTML element sets, LSP types, etc.)
+// These are "enum/namespace objects" bundled as a var. Score 9 when matched.
+
+const NAMESPACE_SIGNATURES = [
+  // HTTP method constants (DELETE/GET/POST/PUT/etc.)
+  { name: 'httpMethods',   score: 9, required: 2,
+    props: new Set(['GET','POST','PUT','DELETE','PATCH','HEAD','OPTIONS','TRACE','CONNECT']) },
+  // HTML tag name sets
+  { name: 'htmlTags',      score: 9, required: 3,
+    props: new Set(['TBODY','THEAD','TFOOT','CAPTION','COLGROUP','TABLE','TR','TD','TH','BODY','HEAD','HTML','DIV','SPAN','FORM']) },
+  { name: 'htmlElems',     score: 8, required: 3,
+    props: new Set(['ADDRESS','APPLET','AREA','ARTICLE','ASIDE','BASE','BASEFONT','BGSOUND','BLOCKQUOTE','CENTER','FRAME']) },
+  // LSP (Language Server Protocol) request types
+  { name: 'lspRequests',   score: 9, required: 2,
+    props: new Set(['WorkspaceSymbolRequest','CodeActionRequest','DocumentSymbolRequest','ReferencesRequest','DefinitionRequest','SignatureHelpRequest','DocumentHighlightRequest']) },
+  // LSP protocol core
+  { name: 'lspProto',      score: 9, required: 2,
+    props: new Set(['ProgressType','createMessageConnection','NullLogger','ConnectionOptions','ConnectionStrategy','AbstractMessageBuffer','WriteableStreamMessageWriter']) },
+  // LSP notification types
+  { name: 'lspNotifs',     score: 8, required: 2,
+    props: new Set(['NotificationType9','NotificationType8','NotificationType7','NotificationType6','NotificationType5']) },
+  // DOM error types
+  { name: 'domErrors',     score: 9, required: 2,
+    props: new Set(['IndexSizeError','HierarchyRequestError','WrongDocumentError','InvalidCharacterError','NotFoundError','NotSupportedError','NamespaceError']) },
+  // Yoga/flexbox layout constants
+  { name: 'yogaConsts',    score: 9, required: 2,
+    props: new Set(['POSITION_TYPE_ABSOLUTE','POSITION_TYPE_RELATIVE','EDGE_ALL','EDGE_HORIZONTAL','EDGE_VERTICAL','EDGE_START','EDGE_END']) },
+  // HTTP parser constants
+  { name: 'httpParserConsts', score: 8, required: 3,
+    props: new Set(['SPECIAL_HEADERS','HTAB_SP_VCHAR_OBS_TEXT','QUOTED_STRING','CONNECTION_TOKEN_CHARS','HEADER_CHARS','TOKEN','MINOR','MAJOR']) },
+  // Character code constants
+  { name: 'charCodes',     score: 8, required: 3,
+    props: new Set(['SPACE','LINE_FEED','TABULATION','FORM_FEED','DIGIT_0','DIGIT_9','LATIN_CAPITAL_A','LATIN_CAPITAL_Z','LATIN_SMALL_A']) },
+  // Semver regex parts
+  { name: 'semverParts',   score: 9, required: 2,
+    props: new Set(['NUMERICIDENTIFIER','NONNUMERICIDENTIFIER','MAINVERSION','MAINVERSIONLOOSE','PRERELEASEIDENTIFIER','PRERELEASEIDENTIFIERLOOSE']) },
+  // Type enum (domElement/observable/array/buffer/undefined/string/number)
+  { name: 'typeEnum',      score: 8, required: 3,
+    props: new Set(['domElement','observable','array','buffer','undefined','string','number','nan','boolean','object','function']) },
+  // HTML parse error types
+  { name: 'htmlParseErrors', score: 9, required: 3,
+    props: new Set(['duplicateAttribute','unexpectedNullCharacter','unexpectedQuestionMarkInsteadOfTagName','eofBeforeTagName','invalidFirstCharacterOfTagName','missingEndTagName']) },
+];
+
+function buildNamespaceSigIndex(shapeIndex) {
+  const result = new Map(); // varName → {name, score}
+  for (const [varName, props] of shapeIndex) {
+    let best = null;
+    for (const sig of NAMESPACE_SIGNATURES) {
+      let hits = 0;
+      for (const p of props) { if (sig.props.has(p)) hits++; }
+      if (hits >= sig.required) {
+        // Bonus: more hits = higher confidence (cap at sig.score)
+        const score = Math.min(sig.score, sig.score * (hits / sig.required) * 0.9 + sig.score * 0.1);
+        if (!best || score > best.score) best = { name: sig.name, score: Math.min(9, score) };
+      }
+    }
+    if (best) result.set(varName, best);
+  }
+  return result;
+}
+
 // When `const { token, userId } = ab`, we know 'ab' holds those keys.
 // Build an index: varName → [keyNames destructured from it]
 
@@ -1714,6 +1778,20 @@ Object.assign(TYPE_NAMES, {
   protoObj:       'protoObj',
   callback:       'callback',
   filePath:       'filePath',
+  // Namespace signature types
+  httpMethods:    'httpMethods',
+  htmlTags:       'htmlTags',
+  htmlElems:      'htmlElems',
+  lspRequests:    'lspRequests',
+  lspProto:       'lspProto',
+  lspNotifs:      'lspNotifs',
+  domErrors:      'domErrors',
+  yogaConsts:     'yogaConsts',
+  httpParserConsts:'httpParserConsts',
+  charCodes:      'charCodes',
+  semverParts:    'semverParts',
+  typeEnum:       'typeEnum',
+  htmlParseErrors:'htmlParseErrors',
 });
 
 function buildCallArgIndex(ast) {
@@ -2139,6 +2217,22 @@ export async function buildRenameMap(source, opts = {}) {
   }
   if (process.env.DEBUG_RECOVER) {
     console.error(`[propAgg] index=${propAggIndex.size} bindings_hit=${_propAggHits} shapeVars=${shapeIndex.size}`);
+  }
+
+  // Phase 2b-ns: namespace signature detection (HTTP methods, HTML tags, LSP types, etc.)
+  // High-confidence direct initName override (score 9) for vars that ARE known constant tables.
+  const namespaceSigIndex = buildNamespaceSigIndex(shapeIndex);
+  let _nsSigHits = 0;
+  for (const [name, info] of namespaceSigIndex) {
+    const b = bindings.get(name);
+    if (b && info.score > (b.initScore ?? 0)) {
+      b.initName  = info.name;
+      b.initScore = info.score;
+      _nsSigHits++;
+    }
+  }
+  if (process.env.DEBUG_RECOVER) {
+    console.error(`[nsSig] hits=${_nsSigHits}`);
   }
 
   // Phase 2c: destructuring source index (what keys were extracted from each var)
