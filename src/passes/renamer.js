@@ -211,54 +211,85 @@ function scoreInit(init) {
           'target','parent','child','current','last','first','next','prev','self',
         ]);
         
-        // Deep-scan factory body for naming clues
-        const body = factory.body?.body ?? (Array.isArray(factory.body) ? factory.body : []);
+        // CJS pattern: S((exports, module) => {...})
+        // First param = exports object; assignments to exports.key are the module's public API
+        const exportsParam = factory.params?.[0]?.name;
+        
         const candidates = []; // {name, priority}
-
-        for (const stmt of body) {
-          const decls = stmt.type === 'VariableDeclaration' ? stmt.declarations : [];
-          for (const decl of decls) {
-            const init = decl.init;
-            if (!init) continue;
-            // Ce("node:xxx") imports → highest priority
-            if (init.type === 'CallExpression' && init.callee?.name === 'Ce') {
-              const mod = init.arguments?.[0]?.value;
-              if (typeof mod === 'string') {
-                const short = mod.replace(/^node:/, '').replace(/\//g,'_');
-                if (!['buffer','util','events'].includes(short)) { // too generic
-                  const cname = short.replace(/_([a-z])/g,(_,c)=>c.toUpperCase());
-                  candidates.push({ name: `${cname}Mod`, priority: 9 });
-                }
+        
+        // Recursive AST walk to find CJS export patterns deeply nested in body
+        function walkForExports(node, depth) {
+          if (!node || typeof node !== 'object' || depth > 8) return;
+          // Don't descend into nested function scopes (inner functions have own exports)
+          if (depth > 0 && (node.type === 'FunctionExpression' || node.type === 'ArrowFunctionExpression')) return;
+          
+          if (node.type === 'AssignmentExpression') {
+            if (node.left?.type === 'MemberExpression' &&
+                node.left.property?.type === 'Identifier') {
+              const key = node.left.property.name;
+              const obj = node.left.object?.name;
+              // CJS export: exportsParam.longKey = val
+              if (exportsParam && obj === exportsParam && key.length >= 5 && !GENERIC_KEYS.has(key)) {
+                const kname = key.charAt(0).toLowerCase() + key.slice(1);
+                candidates.push({ name: `${kname}Mod`, priority: 8 });
               }
-            }
-            // DestructuredPattern from a call: var{longName:x, longName2:y} = require()
-            if (decl.id?.type === 'ObjectPattern' && init.type === 'CallExpression') {
-              for (const prop of decl.id.properties || []) {
-                const key = prop.key?.name ?? prop.key?.value;
-                if (typeof key === 'string' && key.length >= 8 && !GENERIC_KEYS.has(key)) {
-                  candidates.push({ name: `${key.charAt(0).toLowerCase()+key.slice(1)}Mod`, priority: 7 });
-                }
-              }
-            }
-            // Symbol("name") → symbolName
-            if (init.type === 'CallExpression' && init.callee?.name === 'Symbol') {
-              const sym = init.arguments?.[0]?.value;
-              if (typeof sym === 'string' && sym.length >= 3) {
-                candidates.push({ name: `sym_${toIdentifier(sym).slice(0,20)}`, priority: 6 });
+              // Generic: obj.longKey = val (any nesting)
+              else if (key.length >= 5 && !GENERIC_KEYS.has(key)) {
+                candidates.push({ name: `${key.charAt(0).toLowerCase()+key.slice(1)}Mod`, priority: 4 });
               }
             }
           }
-          // Export assignment: obj.longKey = val
-          const expr = stmt.type === 'ExpressionStatement' ? stmt.expression : null;
-          if (expr?.type === 'AssignmentExpression' &&
-              expr.left?.type === 'MemberExpression' &&
-              expr.left.property?.type === 'Identifier') {
-            const key = expr.left.property.name;
-            if (key.length >= 5 && !GENERIC_KEYS.has(key)) {
-              candidates.push({ name: `${key.charAt(0).toLowerCase()+key.slice(1)}Mod`, priority: 4 });
+          
+          if (node.type === 'VariableDeclaration') {
+            for (const decl of node.declarations || []) {
+              const init = decl.init;
+              if (!init) continue;
+              // Ce("node:xxx") import
+              if (init.type === 'CallExpression' && init.callee?.name === 'Ce') {
+                const mod = init.arguments?.[0]?.value;
+                if (typeof mod === 'string') {
+                  const short = mod.replace(/^node:/, '').replace(/[/-]/g,'_');
+                  const cname = short.replace(/_([a-z])/g,(_,c)=>c.toUpperCase());
+                  // Non-generic node modules get high priority
+                  const priority = ['buffer','util','events','stream','string_decoder'].includes(short) ? 5 : 9;
+                  candidates.push({ name: `${cname}Mod`, priority });
+                }
+              }
+              // Destructured import: var{longName: x} = something()
+              if (decl.id?.type === 'ObjectPattern' && init.type === 'CallExpression') {
+                for (const prop of decl.id.properties || []) {
+                  const key = prop.key?.name ?? prop.key?.value;
+                  if (typeof key === 'string' && key.length >= 8 && !GENERIC_KEYS.has(key)) {
+                    const kname = key.charAt(0).toLowerCase() + key.slice(1);
+                    candidates.push({ name: `${kname}Mod`, priority: 7 });
+                  }
+                }
+              }
+              // Symbol("name")
+              if (init.type === 'CallExpression' && init.callee?.name === 'Symbol') {
+                const sym = init.arguments?.[0]?.value;
+                if (typeof sym === 'string' && sym.length >= 3) {
+                  candidates.push({ name: `sym_${toIdentifier(sym).slice(0,20)}`, priority: 6 });
+                }
+              }
+            }
+          }
+          
+          // Recurse into child nodes
+          for (const key of Object.keys(node)) {
+            if (key === 'type' || key === 'start' || key === 'end' || key === 'loc') continue;
+            const child = node[key];
+            if (Array.isArray(child)) {
+              for (const item of child) {
+                if (item && typeof item.type === 'string') walkForExports(item, depth+1);
+              }
+            } else if (child && typeof child.type === 'string') {
+              walkForExports(child, depth+1);
             }
           }
         }
+        
+        walkForExports(factory.body, 0);
 
         if (candidates.length > 0) {
           candidates.sort((a,b) => b.priority - a.priority);
